@@ -98,7 +98,16 @@ class Connection:
         self.peer = peer
         self.verbose = verbose
 
+        # the global counter for the server's seq_num 
+        self.out_seq = 0;
+        # tracks the most recently sent sequence numbers for client echoing
+        self.last_priority_grant_seq = None;
+        self.last_game_state_update_seq = None;
+        self.last_phase_tranisition_seq = None;
+
     def send_pdu(self, pdu: dict) -> None:
+        self.out_seq += 1;
+        pdu["seq_num"] = self.out_seq
         self.sock.sendall(encode_pdu(pdu))
         self._log("SEND", pdu)
 
