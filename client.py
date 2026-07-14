@@ -35,8 +35,10 @@ def _handle_game_over(label: str, conn: Connection, pdu: dict) -> None:
 def _handle_error(label: str, conn: Connection, pdu: dict) -> None:
     pass
 
-def _handle_pong(label: str, conn: Connection, pdu: dict) -> None:
-    pass
+def _handle_pong(conn: Connection, pdu: dict) -> None:
+    now = int(time.time() * 1000)
+    rtt = now - pdu["timestamp"]
+    log(f"[client] PONG received (seq_num={pdu['seq_num']}), rtt={rtt}ms")
 
 # handler table to call the corresponding method of each pdu type
 _handlers = {
@@ -85,7 +87,15 @@ def interactive_loop(conn: Connection) -> None:
         ping = {"type": "PING", "seq_num": ping_seq,
                 "timestamp": int(time.time() * 1000)}
         conn.send_pdu(ping)
-        conn.recv_pdu() # the echoed PING (logged if verbose)
+        log("[client] Sent PING, now waiting for server response...")
+
+        response = conn.recv_pdu() # the echoed PING (logged if verbose)
+        log(f"[client] Debug received: {response}")
+        handler = _handlers.get(response["type"])
+        if handler is None:
+            log(f"[client] Unknown pdu type {response['type']}!")
+        else:
+            handler(conn, response)
         ping_seq += 1
 
 
@@ -109,7 +119,8 @@ def main() -> None:
     conn = Connection(sock, local="CLIENT", peer="SERVER", verbose=args.verbose)
     log(f"[client] connected to {args.host}:{args.port}")
     try:
-        run_self_test(conn)
+        # commenting out run_self_test for now, you may verify connection by sending PING
+        # run_self_test(conn)
         interactive_loop(conn)
     except ConnectionClosed:
         # Happens to the third client, the server accepts then

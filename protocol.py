@@ -106,9 +106,11 @@ class Connection:
         self.last_phase_tranisition_seq = None;
 
     def send_pdu(self, pdu: dict) -> None:
-        self.out_seq += 1;
-        pdu["seq_num"] = self.out_seq
-        self.sock.sendall(encode_pdu(pdu))
+        if "seq_num" not in pdu:
+            self.out_seq += 1;                                                                                                                                        
+            pdu["seq_num"] = self.out_seq
+        
+        self.sock.sendall(encode_pdu(pdu))                                                  
         self._log("SEND", pdu)
 
     def recv_pdu(self) -> dict:

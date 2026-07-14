@@ -94,7 +94,7 @@ class GameServer:
                     conn.send_pdu({
                         "type" : "ERROR",
                         "code" : "UNKNOWN TYPE",
-                        "message" : f"Unknown '{pdu["type"]}' action.",
+                        "message" : f"Unknown '{pdu['type']}' action.",
                     })
                 else:
                     handler(label, conn, pdu)
@@ -155,8 +155,12 @@ class GameServer:
     def _handle_concede(label: str, conn: Connection, pdu: dict) -> None:
         pass
 
-    def _handle_ping(label: str, conn: Connection, pdu: dict) -> None:
-        pass
+    def _handle_ping(self, label: str, conn: Connection, pdu: dict) -> None:
+        conn.send_pdu({
+            "type" : "PONG",
+            "seq_num": pdu["seq_num"],
+            "timestamp": pdu["timestamp"]
+        })
 
 
 def main() -> None:
