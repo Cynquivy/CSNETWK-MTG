@@ -16,6 +16,24 @@ class GameServer:
         self.clients = {}
         self.lock = threading.Lock()
 
+        # handler table to call the corresponding method of each pdu type
+        self._handlers = {
+            "PLAYER_READY" : self._handle_player_ready,
+            "MULLIGAN_CHOICE" : self._handle_mulligan_choice,
+            "PRIORITY_PASS" : self._handle_priority_pass,
+            "CAST_SPELL" : self._handle_cast_spell,
+            "ACTIVATE_ABILITY" : self._handle_activate_ability,
+            "TRIGGER_ORDER_RESPONSE" : self._handle_trigger_order_response,
+            "TRIGGER_CHOICE_RESPONSE" : self._handle_trigger_choice_response,
+            "DECLARE_ATTACKERS" : self._handle_declare_attackers,
+            "DECLARE_BLOCKERS" : self._handle_declare_blockers,
+            "ASSIGN_DAMAGE_ORDER" : self._handle_assign_damage_order,
+            "PLAY_LAND" : self._handle_play_land,
+            "DISCARD" : self._handle_discard,
+            "CONCEDE" : self._handle_concede,
+            "PING" : self._handle_ping
+        }
+
     def start(self) -> None:
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
@@ -71,7 +89,15 @@ class GameServer:
         try:
             while True:
                 pdu = conn.recv_pdu()      # blocks until a full PDU arrives
-                conn.send_pdu(pdu)
+                handler = self._handlers.get(pdu["type"])
+                if handler is None:
+                    conn.send_pdu({
+                        "type" : "ERROR",
+                        "code" : "UNKNOWN TYPE",
+                        "message" : f"Unknown '{pdu["type"]}' action.",
+                    })
+                else:
+                    handler(label, conn, pdu)
 
         except ConnectionClosed:
             log(f"[server] {label} disconnected")
@@ -88,6 +114,49 @@ class GameServer:
                 self.clients.pop(label, None)
                 remaining = len(self.clients)
             log(f"[server] {label} slot freed ({remaining}/{MAX_PLAYERS} players)")
+
+    ### HANDLERS ###
+    def _handle_player_ready(label: str, conn: Connection, pdu: dict) -> None:
+        pass
+
+    def _handle_mulligan_choice(label: str, conn: Connection, pdu: dict) -> None:
+        pass
+
+    def _handle_priority_pass(label: str, conn: Connection, pdu: dict) -> None:
+        pass
+
+    def _handle_cast_spell(label: str, conn: Connection, pdu: dict) -> None:
+        pass
+
+    def _handle_activate_ability(label: str, conn: Connection, pdu: dict) -> None:
+        pass
+
+    def _handle_trigger_order_response(label: str, conn: Connection, pdu: dict) -> None:
+        pass
+
+    def _handle_trigger_choice_response(label: str, conn: Connection, pdu: dict) -> None:
+        pass
+
+    def _handle_declare_attackers(label: str, conn: Connection, pdu: dict) -> None:
+        pass
+
+    def _handle_declare_blockers(label: str, conn: Connection, pdu: dict) -> None:
+        pass
+
+    def _handle_assign_damage_order(label: str, conn: Connection, pdu: dict) -> None:
+        pass
+
+    def _handle_play_land(label: str, conn: Connection, pdu: dict) -> None:
+        pass
+
+    def _handle_discard(label: str, conn: Connection, pdu: dict) -> None:
+        pass
+
+    def _handle_concede(label: str, conn: Connection, pdu: dict) -> None:
+        pass
+
+    def _handle_ping(label: str, conn: Connection, pdu: dict) -> None:
+        pass
 
 
 def main() -> None:

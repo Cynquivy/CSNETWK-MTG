@@ -5,6 +5,54 @@ import time
 import protocol
 from protocol import (Connection, ConnectionClosed, ProtocolError, log)
 
+def _handle_game_state_update(label: str, conn: Connection, pdu: dict) -> None:
+    pass
+
+def _handle_phase_transition(label: str, conn: Connection, pdu: dict) -> None:
+    pass
+
+def _handle_priority_grant(label: str, conn: Connection, pdu: dict) -> None:
+    pass
+
+def _handle_stack_push(label: str, conn: Connection, pdu: dict) -> None:
+    pass
+
+def _handle_trigger_order(label: str, conn: Connection, pdu: dict) -> None:
+    pass
+
+def _handle_trigger_choice(label: str, conn: Connection, pdu: dict) -> None:
+    pass
+
+def _handle_stack_resolve(label: str, conn: Connection, pdu: dict) -> None:
+    pass
+
+def _handle_combat_damage_result(label: str, conn: Connection, pdu: dict) -> None:
+    pass
+
+def _handle_game_over(label: str, conn: Connection, pdu: dict) -> None:
+    pass
+
+def _handle_error(label: str, conn: Connection, pdu: dict) -> None:
+    pass
+
+def _handle_pong(label: str, conn: Connection, pdu: dict) -> None:
+    pass
+
+# handler table to call the corresponding method of each pdu type
+_handlers = {
+    "GAME_STATE_UPDATE" : _handle_game_state_update,
+    "PHASE_TRANSITION" : _handle_phase_transition,
+    "PRIORITY_GRANT" : _handle_priority_grant,
+    "STACK_PUSH" : _handle_stack_push,
+    "TRIGGER_ORDER" : _handle_trigger_order,
+    "TRIGGER_CHOICE" : _handle_trigger_choice,
+    "STACK_RESOLVE" : _handle_stack_resolve,
+    "COMBAT_DAMAGE_RESULT" : _handle_combat_damage_result,
+    "GAME_OVER" : _handle_game_over,
+    "ERROR" : _handle_error,
+    "PONG" : _handle_pong
+}
+
 # Dummy PDU for echo testing
 def run_self_test(conn: Connection) -> None:
     dummy = {
