@@ -2,8 +2,8 @@ import argparse
 import socket
 import threading
 
-import protocol
-from protocol import (Connection, ConnectionClosed, ProtocolError, log)
+from network import protocol
+from network.protocol import (Connection, ConnectionClosed, ProtocolError, log)
 
 MAX_PLAYERS = 2
 
@@ -116,43 +116,43 @@ class GameServer:
             log(f"[server] {label} slot freed ({remaining}/{MAX_PLAYERS} players)")
 
     ### HANDLERS ###
-    def _handle_player_ready(label: str, conn: Connection, pdu: dict) -> None:
+    def _handle_player_ready(self, label: str, conn: Connection, pdu: dict) -> None:
         pass
 
-    def _handle_mulligan_choice(label: str, conn: Connection, pdu: dict) -> None:
+    def _handle_mulligan_choice(self, label: str, conn: Connection, pdu: dict) -> None:
         pass
 
-    def _handle_priority_pass(label: str, conn: Connection, pdu: dict) -> None:
+    def _handle_priority_pass(self, label: str, conn: Connection, pdu: dict) -> None:
         pass
 
-    def _handle_cast_spell(label: str, conn: Connection, pdu: dict) -> None:
+    def _handle_cast_spell(self, label: str, conn: Connection, pdu: dict) -> None:
         pass
 
-    def _handle_activate_ability(label: str, conn: Connection, pdu: dict) -> None:
+    def _handle_activate_ability(self, label: str, conn: Connection, pdu: dict) -> None:
         pass
 
-    def _handle_trigger_order_response(label: str, conn: Connection, pdu: dict) -> None:
+    def _handle_trigger_order_response(self, label: str, conn: Connection, pdu: dict) -> None:
         pass
 
-    def _handle_trigger_choice_response(label: str, conn: Connection, pdu: dict) -> None:
+    def _handle_trigger_choice_response(self, label: str, conn: Connection, pdu: dict) -> None:
         pass
 
-    def _handle_declare_attackers(label: str, conn: Connection, pdu: dict) -> None:
+    def _handle_declare_attackers(self, label: str, conn: Connection, pdu: dict) -> None:
         pass
 
-    def _handle_declare_blockers(label: str, conn: Connection, pdu: dict) -> None:
+    def _handle_declare_blockers(self, label: str, conn: Connection, pdu: dict) -> None:
         pass
 
-    def _handle_assign_damage_order(label: str, conn: Connection, pdu: dict) -> None:
+    def _handle_assign_damage_order(self, label: str, conn: Connection, pdu: dict) -> None:
         pass
 
-    def _handle_play_land(label: str, conn: Connection, pdu: dict) -> None:
+    def _handle_play_land(self, label: str, conn: Connection, pdu: dict) -> None:
         pass
 
-    def _handle_discard(label: str, conn: Connection, pdu: dict) -> None:
+    def _handle_discard(self, label: str, conn: Connection, pdu: dict) -> None:
         pass
 
-    def _handle_concede(label: str, conn: Connection, pdu: dict) -> None:
+    def _handle_concede(self, label: str, conn: Connection, pdu: dict) -> None:
         pass
 
     def _handle_ping(self, label: str, conn: Connection, pdu: dict) -> None:

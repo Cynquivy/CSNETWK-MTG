@@ -7,7 +7,7 @@ from datetime import datetime
 # Fixed constants from Section 5.1
 LENGTH_PREFIX_BYTES = 4         # 4-byte big-endian length header
 MAX_PDU_BYTES = 65_535          # A PDU MUST NOT exceed 65,535 bytes
-DEFAULT_PORT = 4444             # Default server port is 4444
+DEFAULT_PORT = 4444             # Default GameServer port is 4444
 ENCODING = "utf-8"              # All JSON MUST be valid UTF-8
 
 
@@ -33,7 +33,7 @@ class MalformedPDU(ProtocolError):
 _print_lock = threading.Lock()
 
 def log(message: str) -> None:
-    """Thread-safe stdout print used for all server/client output."""
+    """Thread-safe stdout print used for all GameServer/client output."""
     with _print_lock:
         print(message, flush=True)
 
@@ -98,7 +98,7 @@ class Connection:
         self.peer = peer
         self.verbose = verbose
 
-        # the global counter for the server's seq_num 
+        # the global counter for the GameServer's seq_num 
         self.out_seq = 0;
         # tracks the most recently sent sequence numbers for client echoing
         self.last_priority_grant_seq = None;

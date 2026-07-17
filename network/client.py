@@ -2,8 +2,8 @@ import argparse
 import socket
 import time
 
-import protocol
-from protocol import (Connection, ConnectionClosed, ProtocolError, log)
+from network import protocol
+from network.protocol import (Connection, ConnectionClosed, ProtocolError, log)
 
 def _handle_game_state_update(label: str, conn: Connection, pdu: dict) -> None:
     pass
@@ -67,7 +67,7 @@ def run_self_test(conn: Connection) -> None:
     conn.send_pdu(dummy)
     echo = conn.recv_pdu()
     if echo == dummy:
-        log("[client] self-test PASSED: server echoed an identical PDU")
+        log("[client] self-test PASSED: GameServer echoed an identical PDU")
     else:
         log("[client] self-test FAILED: echo did not match what was sent")
         log(f"          sent: {dummy}")
@@ -87,7 +87,7 @@ def interactive_loop(conn: Connection) -> None:
         ping = {"type": "PING", "seq_num": ping_seq,
                 "timestamp": int(time.time() * 1000)}
         conn.send_pdu(ping)
-        log("[client] Sent PING, now waiting for server response...")
+        log("[client] Sent PING, now waiting for GameServer response...")
 
         response = conn.recv_pdu() # the echoed PING (logged if verbose)
         log(f"[client] Debug received: {response}")
@@ -102,9 +102,9 @@ def interactive_loop(conn: Connection) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="MTGNP Player Client (Milestone 0)")
     parser.add_argument("--host", default="127.0.0.1",
-                        help="server host (default: 127.0.0.1)")
+                        help="GameServer host (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=protocol.DEFAULT_PORT,
-                        help=f"server TCP port (default: {protocol.DEFAULT_PORT})")
+                        help=f"GameServer TCP port (default: {protocol.DEFAULT_PORT})")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="print every PDU sent and received")
     args = parser.parse_args()
@@ -123,9 +123,9 @@ def main() -> None:
         # run_self_test(conn)
         interactive_loop(conn)
     except ConnectionClosed:
-        # Happens to the third client, the server accepts then
+        # Happens to the third client, the GameServer accepts then
         # closes the socket cus two players are already present.
-        log("[client] server closed the connection (it may already be full)")
+        log("[client] GameServer closed the connection (it may already be full)")
     except ProtocolError as exc:
         log(f"[client] protocol error: {exc}")
     except (OSError, KeyboardInterrupt):
