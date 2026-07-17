@@ -1,6 +1,6 @@
 
 class Card:
-    def __init__(self, card_id_base, card_name, card_type, subtype, color, CMC, mana_white, mana_blue, mana_black, mana_red, mana_green, mana_generic, power, toughness, is_hidden):
+    def __init__(self, card_id_base, card_name, card_type, subtype, color, CMC, mana_white, mana_blue, mana_black, mana_red, mana_green, mana_generic, power, toughness):
         self.card_id_base = card_id_base
         self.card_name = card_name
         self.card_type = card_type

@@ -4,6 +4,8 @@ class Player:
         self.player_name = player_name
         self.life = 20
         self.is_active = False
+        self.keep_cards = True
+        self.mulligan_count = 0
         self.white_mpool = 0
         self.blue_mpool = 0
         self.black_mpool = 0

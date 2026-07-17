@@ -1,16 +1,26 @@
 from model.Phase import Phase
 
-class GameController:
-    def __init__(self):
-        self.phase = Phase.START
-        self.game_start = True
-        self.game_over = False
-        self.atk_player_index = 0
-        self.def_player_index = 1
-        self.players = []
-        
+    class GameController:
+        def __init__(self):
+            self.phase = Phase.START
+            self.game_start = True
+            self.game_over = False
+            self.atk_player_index = 0
+            self.def_player_index = 1
+            self.players = []
+            
+            self.initialize_library()
+            self.draw_from_lib(0, 7)
+            self.draw_from_lib(1, 7)
+            
     def initialize_library(self):
         pass
+    
+    def draw_from_lib(self, player_index, card_num):
+        for _ in range(card_num):
+            self.players[player_index].hand.append(self.players[player_index].library[-1])
+            self.players[player_index].library.pop()
+            
     
     def do_game_start(self):
         pass
