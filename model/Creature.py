@@ -1,12 +1,11 @@
-from model import Card
-from model import Land
+from model import card
+from model import land
 
-class Creature(Card):
+class creature(card):
     
-    def __init__(self, power, toughness):
-        self.power = power
-        self.toughness = toughness
-        self.card_id = ""
+    def __init__(self, card_id, color, CMC, mana_white, mana_blue, mana_black, mana_red, mana_green, mana_generic, power, toughness):
+        super().__init__(card_id, color, CMC, mana_white, mana_blue, mana_black, mana_red, mana_green, mana_generic, power, toughness)
+        self.set_card_type()
         self.will_attack = False
         self.will_block = False
         self.is_tappable = False
@@ -16,11 +15,13 @@ class Creature(Card):
         self.did_kick = False
         self.has_madness = False
     
+    def set_card_type(self):
+        self.card_type = "Creature"
+    
     def effect(self, controller):
         
         atk_player = controller.players[controller.atk_player_index]
         def_player = controller.players[controller.def_player_index]
-        
         
         match self.card_id:
             # RED CREATURES
@@ -33,7 +34,7 @@ class Creature(Card):
                 if self.will_attack:
                     top_card = def_player.library.top()
                     top_card.is_hidden = False
-                    if isinstance(top_card, Land):
+                    if isinstance(top_card, land):
                         def_player.hand.append(top_card)
                         def_player.library.pop()
                 
@@ -41,7 +42,7 @@ class Creature(Card):
                 # Kicker {1}{R}
                 if self.did_kick:
                     for card in atk_player.board:
-                        if isinstance(card, Creature):
+                        if isinstance(card, creature):
                             card.power += 1
                             if not card.has_haste:
                                 card.has_haste = True

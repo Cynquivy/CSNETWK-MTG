@@ -1,10 +1,11 @@
 
-class Card:
-    def __init__(self, card_id_base, card_name, card_type, subtype, color, CMC, mana_white, mana_blue, mana_black, mana_red, mana_green, mana_generic, power, toughness):
-        self.card_id_base = card_id_base
-        self.card_name = card_name
-        self.card_type = card_type
-        self.subtype = subtype
+class card:
+    def __init__(self, card_id, color, CMC, mana_white, mana_blue, mana_black, mana_red, mana_green, mana_generic, power, toughness):
+        self.card_id = card_id
+        self.card_name = ""
+        self.set_card_name()
+        self.card_type = ""
+        # self.subtype = ""
         self.color = color
         self.CMC = CMC
         self.mana_white = mana_white
@@ -16,3 +17,8 @@ class Card:
         self.power = power
         self.toughness = toughness
         self.is_hidden = True
+
+    def set_card_name(self):
+        name = self.card_id.rsplit("_", 1)[0]
+        name = name.replace("_", " ")
+        self.card_name = name.title()

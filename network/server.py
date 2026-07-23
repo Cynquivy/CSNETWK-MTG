@@ -5,6 +5,9 @@ import threading
 from network import protocol
 from network.protocol import (Connection, ConnectionClosed, ProtocolError, log)
 
+from model.phase import Phase
+from model.player import player
+
 MAX_PLAYERS = 2
 
 
@@ -15,6 +18,8 @@ class GameServer:
         self.verbose = verbose
         self.clients = {}
         self.lock = threading.Lock()
+        # controls flow of game
+        self.session = GameSession()
 
         # handler table to call the corresponding method of each pdu type
         self._handlers = {
@@ -163,6 +168,105 @@ class GameServer:
         })
 
 
+class GameSession:
+    def __init__(self):
+        self.controller = GameController()
+    
+    while not self.controller.state.game_over:
+        pass
+
+class GameController:
+    def __init__(self):
+        self.state = GameState()
+        self.players = []
+        self.initialize_players()
+    
+    def initialize_players(self, p1: player, p2: player):
+        self.players[0] = p1
+        self.players[1] = p2
+    
+    def do_untap(self):
+        for player in self.players:
+            for card in player.board:
+                if card.is_tapped:
+                    card.is_tapped = False
+    
+    def do_upkeep(self):
+        pass
+    
+    def do_draw(self):
+        pass
+    
+    def do_main_one(self):
+        pass
+    
+    def begin_combat(self):
+        pass
+    
+    def declare_attackers(self):
+        pass
+    
+    def declare_blockers(self):
+        pass
+    
+    def execute_combat(self):
+        pass
+    
+    def end_combat(self):
+        pass
+    
+    def do_main_two(self):
+        pass
+    
+    def do_end_step(self):
+        pass
+    
+    def do_cleanup(self):
+        pass
+
+class GameState:
+    def __init__(self):
+        self.phase = Phase.UNTAP
+        self.game_start = True
+        self.game_over = False
+        self.atk_idx = 0
+        self.def_idx = 1
+        
+    def next_phase(self):
+        match self.phase:
+            case Phase.UNTAP:
+                self.phase = Phase.UPKEEP
+            case Phase.UPKEEP:
+                self.phase = Phase.DRAW
+            case Phase.DRAW:
+                self.phase = Phase.MAIN_ONE
+            case Phase.MAIN_ONE:
+                self.phase = Phase.COMBAT_BEGINNING
+            case Phase.COMBAT_BEGINNING:
+                self.phase = Phase.DECLARE_ATTACKERS
+            case Phase.DECLARE_ATTACKERS:
+                self.phase = Phase.DECLARE_BLOCKERS
+            case Phase.DECLARE_BLOCKERS:
+                self.phase = Phase.COMBAT_EXECUTE
+            case Phase.COMBAT_EXECUTE:
+                self.phase = Phase.COMBAT_ENDING
+            case Phase.COMBAT_ENDING:
+                self.phase = Phase.MAIN_TWO
+            case Phase.MAIN_TWO:
+                self.phase = Phase.END_STEP
+            case Phase.END_STEP:
+                self.phase = Phase.CLEANUP
+            case Phase.CLEANUP:
+                self.active_player_index = (self.active_player_index + 1) % 2
+                self.phase = Phase.UNTAP
+    
+    def switch_AP(self):
+        self.atk_idx = (self.atk_idx + 1) % 2
+        self.def_idx = (self.atk_idx + 1) % 2
+        
+    def set_to_game_over(self):
+        self.game_over = True
+    
 def main() -> None:
     parser = argparse.ArgumentParser(description="MTGNP Game Server")
     parser.add_argument("--host", default="0.0.0.0",

@@ -1,7 +1,6 @@
 from enum import Enum, auto
 
 class Phase(Enum):
-    START = auto()
     UNTAP = auto()
     UPKEEP = auto()
     DRAW = auto()

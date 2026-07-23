@@ -1,5 +1,5 @@
 
 class GameUI:
     
-    def selectFromHand(self, player):
-        
+    def getCardSelection(self, hand):
+        pass
