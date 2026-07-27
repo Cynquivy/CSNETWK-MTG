@@ -1,4 +1,4 @@
-from model import card
+from model.card import card
 
 class artifact(card):
     
@@ -8,3 +8,6 @@ class artifact(card):
     
     def set_card_type(self):
         self.card_type = "Artifact"
+    
+    def effect(self):
+        pass

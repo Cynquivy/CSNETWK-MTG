@@ -1,11 +1,13 @@
-from model import card
-from model import land
+from model.card import card
+from model.land import land
 
 class creature(card):
     
     def __init__(self, card_id, color, CMC, mana_white, mana_blue, mana_black, mana_red, mana_green, mana_generic, power, toughness):
         super().__init__(card_id, color, CMC, mana_white, mana_blue, mana_black, mana_red, mana_green, mana_generic, power, toughness)
         self.set_card_type()
+        self.base_power = power
+        self.base_toughness = toughness
         self.will_attack = False
         self.will_block = False
         self.is_tappable = False
@@ -14,9 +16,16 @@ class creature(card):
         self.is_flying = False
         self.did_kick = False
         self.has_madness = False
+        self.blocked_by = []
+        self.damage_order = []
+        self.damage_marked = 0
+        self.was_blocked = False
     
     def set_card_type(self):
         self.card_type = "Creature"
+    
+    def place_to_board(self):
+        pass
     
     def effect(self, controller):
         

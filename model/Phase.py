@@ -8,6 +8,7 @@ class Phase(Enum):
     COMBAT_BEGINNING = auto()
     DECLARE_ATTACKERS = auto() 
     DECLARE_BLOCKERS = auto()
+    ASSIGN_DAMAGE_ORDER = auto()
     COMBAT_EXECUTE = auto()
     COMBAT_ENDING = auto()
     MAIN_TWO = auto()

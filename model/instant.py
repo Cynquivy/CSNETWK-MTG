@@ -1,4 +1,4 @@
-from model import card
+from model.card import card
 
 class instant(card):
     
@@ -8,3 +8,6 @@ class instant(card):
     
     def set_card_type(self):
         self.card_type = "Instant"
+        
+    def effect(self, controller):
+        pass

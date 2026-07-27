@@ -1,4 +1,4 @@
-from model import card
+from model.card import card
 
 class land(card):
     
@@ -29,3 +29,5 @@ class land(card):
                 
             case "swamp":
                 atk_player.black_mpool += 1
+        
+        self.is_tapped = True

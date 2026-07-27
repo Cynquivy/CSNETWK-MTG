@@ -1,4 +1,4 @@
-from model import card
+from model.card import card
 
 class sorcery(card):
     
@@ -8,3 +8,6 @@ class sorcery(card):
     
     def set_card_type(self):
         self.card_type = "Sorcery"
+        
+    def effect(self, controller):
+        pass
