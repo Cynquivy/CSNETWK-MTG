@@ -12,22 +12,7 @@ class land(card):
         self.card_type = "Land"
     
     def effect(self, controller):
-        atk_player = controller.players[controller.state.AP_idx]
-        
-        match self.card_id:
-            case "mountain":
-                atk_player.red_mpool += 1
-            
-            case "forest":
-                atk_player.green_mpool += 1
-            
-            case "plains":
-                atk_player.white_mpool += 1
-            
-            case "island":
-                atk_player.blue_mpool += 1
-                
-            case "swamp":
-                atk_player.black_mpool += 1
-        
-        self.is_tapped = True
+        # Tapping a land for mana is a cost payment (RFC 0001 Section 7.5),
+        # not a stack-resolved effect -- see model/player.py's pay_mana().
+        # None of the basic lands have an enter-the-battlefield effect.
+        pass

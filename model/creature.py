@@ -89,13 +89,13 @@ class creature(card):
             
             # GREEN CREATURES
             case "llanowar_elves":
-                # Add {G}
-                if self.is_tapped:
-                    atk_player.green_mpool += 1
+                # Tap: Add {G} -- a mana-ability cost payment (RFC 0001
+                # Section 7.5), not a stack effect; see
+                # model/player.py's pay_mana().
+                pass
             case "elvish_mystic":
-                # Add {G}
-                if self.is_tapped:
-                    atk_player.green_mpool += 1
+                # Tap: Add {G} -- same as above.
+                pass
             case "grizzly_bears":
                 pass
             case "leatherback_baloth":

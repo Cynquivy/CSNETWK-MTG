@@ -1,5 +1,6 @@
 import random
 from model.card_database import card_database
+from model.mana import mana_output_of, COLORS
 
 class player:
     def __init__(self, player_name, player_id):
@@ -9,11 +10,6 @@ class player:
         self.is_active_player = False
         self.keep_cards = True
         self.mulligan_count = 0
-        self.white_mpool = 0
-        self.blue_mpool = 0
-        self.black_mpool = 0
-        self.red_mpool = 0
-        self.green_mpool = 0
         self.hand = []
         self.board = []
         self.library = []
@@ -83,6 +79,52 @@ class player:
             selected.append(card)
 
         return selected
+
+    def untapped_mana_sources(self):
+        """Permanents on this player's battlefield currently tappable for mana (RFC 7.5)."""
+        return [permanent for permanent in self.board
+                if not getattr(permanent, "is_tapped", True)
+                and mana_output_of(permanent.card_id)]
+
+    def pay_mana(self, mana_payment: dict) -> bool:
+        """
+        Atomically tap enough untapped mana-producing permanents to realize a
+        declared mana_payment (RFC 0001 Section 7.5: mana production is
+        implicit -- no separate mana-ability PDU exists). Either every source
+        needed is found and tapped, or nothing on the board changes and
+        False is returned.
+        """
+        needed = {color: mana_payment.get(color, 0) for color in COLORS}
+        needed["X"] = mana_payment.get("X", 0)
+
+        sources = self.untapped_mana_sources()
+        to_tap = []
+
+        # Satisfy each declared colored amount first, one matching source per unit.
+        for color in COLORS:
+            while needed[color] > 0:
+                source = next((s for s in sources if s not in to_tap
+                               and mana_output_of(s.card_id).get(color, 0) > 0), None)
+                if source is None:
+                    return False
+                to_tap.append(source)
+                needed[color] -= 1
+
+        # Satisfy the declared generic ("X") amount from whatever is left untapped.
+        for source in sources:
+            if needed["X"] <= 0:
+                break
+            if source in to_tap:
+                continue
+            to_tap.append(source)
+            needed["X"] -= sum(mana_output_of(source.card_id).values())
+
+        if needed["X"] > 0:
+            return False
+
+        for source in to_tap:
+            source.is_tapped = True
+        return True
 
     def select_card_to_stack(self):
         pass
