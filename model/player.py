@@ -41,7 +41,8 @@ class player:
     
     def initialize_library(self, deck_list: list):
         if self.validate_deck(deck_list):
-            self.library = self.deck_list.copy()
+            self.deck_list = deck_list
+            self.library = list(self.deck_list)
             random.shuffle(self.library)
     
     def draw_from_lib(self, count):

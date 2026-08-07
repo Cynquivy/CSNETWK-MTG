@@ -29,8 +29,8 @@ class creature(card):
     
     def effect(self, controller):
         
-        atk_player = controller.players[controller.atk_player_index]
-        def_player = controller.players[controller.def_player_index]
+        atk_player = controller.players[controller.state.AP_idx]
+        def_player = controller.players[controller.state.NAP_idx]
         
         match self.card_id:
             # RED CREATURES

@@ -12,7 +12,7 @@ class land(card):
         self.card_type = "Land"
     
     def effect(self, controller):
-        atk_player = controller.players[controller.atk_player_index]
+        atk_player = controller.players[controller.state.AP_idx]
         
         match self.card_id:
             case "mountain":

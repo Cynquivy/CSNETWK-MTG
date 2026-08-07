@@ -101,10 +101,14 @@ class GameServer:
                 pdu = conn.recv_pdu()      # blocks until a full PDU arrives
                 handler = self._handlers.get(pdu["type"])
                 if handler is None:
+                    # RFC 0001 Section 11 / 10.2.23: ERROR echoes the seq_num
+                    # of the rejected action and includes a copy of it.
                     conn.send_pdu({
                         "type" : "ERROR",
-                        "code" : "UNKNOWN TYPE",
-                        "message" : f"Unknown '{pdu['type']}' action.",
+                        "seq_num" : pdu["seq_num"],
+                        "code" : "UNKNOWN_TYPE",
+                        "message" : f"Unknown PDU type '{pdu['type']}'.",
+                        "rejected_action" : pdu,
                     })
                 else:
                     handler(label, conn, pdu)
