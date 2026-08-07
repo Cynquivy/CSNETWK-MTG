@@ -17,6 +17,7 @@ from model.sorcery import sorcery
 from model.card_database import card_database
 from model.stack import StackItem, StackItemType
 from model.mana import payment_covers_cost
+from model.triggers import TriggerEvent, trigger_definition_for
 # Aliased: this file also defines its own (dead, unreachable -- see
 # GameController below) in-file `class GameState`, later in this same
 # module. Since that class definition executes at module-load time, it
@@ -26,6 +27,23 @@ from model.game_state import GameState as ModelGameState
 from model.lifecycle import LifecycleState
 
 MAX_PLAYERS = 2
+
+
+class _PendingTrigger:
+    """
+    Server-internal bookkeeping for one triggered ability that has fired
+    but is not yet on the Stack (RFC 8.6.1-8.6.4). Not RFC wire-visible
+    itself -- trigger_id is the same id used in TRIGGER_ORDER /
+    TRIGGER_CHOICE / STACK_PUSH once it actually gets there.
+    """
+    def __init__(self, trigger_id, source_id, controller_id, definition):
+        self.trigger_id = trigger_id
+        self.source_id = source_id
+        self.controller_id = controller_id
+        self.requires_target = definition.requires_target
+        self.optional = definition.optional
+        self.summary = definition.summary
+
 
 class GameServer:
     def __init__(self, host: str, port: int, verbose: bool):
@@ -65,6 +83,23 @@ class GameServer:
         self._priority_passes = 0
         # RFC 8.3: server-assigned unique Stack item ids ("stk_01", ...).
         self._stack_id_counter = 0
+        # RFC 8.6: server-assigned unique trigger ids ("trg_01", ...).
+        self._trigger_id_counter = 0
+
+        # RFC 8.6.2: while a TRIGGER_ORDER is outstanding, this holds
+        # {"by_player": {player_id: [_PendingTrigger, ...]},
+        #  "awaiting_order_from": {player_id, ...}}. None when no
+        # ordering decision is currently pending.
+        self._trigger_placement = None
+        # RFC 8.6.3/8.6.4: while a TRIGGER_CHOICE is outstanding, this
+        # holds {"trigger": _PendingTrigger, "rest": [remaining queue]}.
+        # None when no choice is currently pending.
+        self._trigger_choice_pending = None
+        # Who should receive priority once the current trigger-placement
+        # workflow finishes (RFC 8.1 rule 3: a caster who triggered
+        # something retains priority); None means "grant to the Active
+        # Player as usual" (RFC 8.1 rule 1/5).
+        self._trigger_priority_recipient = None
 
         # handler table to call the corresponding method of each pdu type
         self._handlers = {
@@ -915,8 +950,26 @@ class GameServer:
         for c in recipients:
             c.send_pdu(pdu_builders.build_stack_push(seq_num=c.next_seq(), stack_item=item))
 
-        conn.send_pdu(pdu_builders.build_priority_grant(
-            seq_num=conn.next_seq(), player_id=player_id))
+        # RFC 8.6.1: "A spell or ability is cast" MUST trigger a check --
+        # e.g. Prowess ("whenever YOU cast a noncreature spell"), which is
+        # why the candidates are scoped to the caster's own permanents.
+        # If anything fired, the trigger workflow (RFC 8.6.1: "Priority
+        # MUST NOT be granted until all pending trigger ordering decisions
+        # and optional trigger choices have been resolved") is now
+        # responsible for eventually granting priority back to this
+        # caster (RFC 8.1 rule 3); otherwise grant it immediately as
+        # before.
+        triggered = False
+        if not isinstance(spell, creature):
+            triggered = self._check_triggers(
+                TriggerEvent.CAST_NONCREATURE_SPELL,
+                [(c.card_id, player_id) for c in caster.board],
+                retain_priority_for=player_id,
+            )
+
+        if not triggered:
+            conn.send_pdu(pdu_builders.build_priority_grant(
+                seq_num=conn.next_seq(), player_id=player_id))
 
     def _handle_activate_ability(self, label: str, conn: Connection, pdu: dict) -> None:
         if self.game_state.lifecycle_state != LifecycleState.IN_GAME:
@@ -1013,11 +1066,286 @@ class GameServer:
         conn.send_pdu(pdu_builders.build_priority_grant(
             seq_num=conn.next_seq(), player_id=player_id))
 
+    ### TRIGGERED ABILITIES (RFC Section 8.6) ###
+
+    def _next_trigger_id(self) -> str:
+        self._trigger_id_counter += 1
+        return f"trg_{self._trigger_id_counter:02d}"
+
+    def _all_target_candidates(self) -> list:
+        """
+        Every id a trigger (or CAST_SPELL/ACTIVATE_ABILITY, RFC 8.4) could
+        plausibly target: seated players, battlefield permanents, and
+        graveyard cards. This card set has no per-effect target-type
+        metadata (e.g. gravedigger's real restriction is specifically
+        "target creature card in YOUR graveyard", not any graveyard card
+        of either player's) -- same documented simplification as
+        GameServer._targets_still_legal (Milestone #9).
+        """
+        with self.lock:
+            ids = list(self.game_state.players.keys())
+            for p in self.game_state.players.values():
+                ids.extend(c.card_id for c in p.board)
+                ids.extend(p.graveyard)
+        return ids
+
+    def _check_triggers(self, event, candidates, retain_priority_for=None) -> bool:
+        """
+        RFC 8.6.1: after a qualifying event, check the given (card_id,
+        controller_id) candidates against the trigger registry. `candidates`
+        is caller-supplied rather than "every permanent on the
+        battlefield" because which permanents can even possibly match a
+        given event is inherently event-specific (e.g. only the attacking
+        creature itself can have a "whenever ~ attacks" trigger; only the
+        caster's own permanents can have a "whenever YOU cast" trigger).
+
+        Returns True if one or more triggers fired, meaning responsibility
+        for eventually granting priority has been handed to the trigger
+        workflow (see _process_trigger_queue) -- the caller must not also
+        grant priority itself in that case. `retain_priority_for`, if
+        given, is who priority should return to once the workflow
+        finishes (RFC 8.1 rule 3); otherwise it goes to the Active Player
+        as usual.
+        """
+        fired = []
+        for card_id, controller_id in candidates:
+            definition = trigger_definition_for(card_id)
+            if definition and definition.event is event:
+                fired.append(_PendingTrigger(
+                    trigger_id=self._next_trigger_id(),
+                    source_id=card_id,
+                    controller_id=controller_id,
+                    definition=definition,
+                ))
+
+        if not fired:
+            return False
+
+        self._trigger_priority_recipient = retain_priority_for
+        self._begin_trigger_placement(fired)
+        return True
+
+    def _begin_trigger_placement(self, fired) -> None:
+        by_player = {}
+        for t in fired:
+            by_player.setdefault(t.controller_id, []).append(t)
+
+        # RFC 8.6.2 rule 3: a player who controls 2+ simultaneous triggers
+        # must choose their own placement order.
+        needs_order = [pid for pid, ts in by_player.items() if len(ts) >= 2]
+
+        self._trigger_placement = {
+            "by_player": by_player,
+            "awaiting_order_from": set(needs_order),
+        }
+
+        if needs_order:
+            for pid in needs_order:
+                self._send_trigger_order(pid, by_player[pid])
+            return
+
+        self._finish_trigger_ordering()
+
+    def _send_trigger_order(self, player_id, triggers_for_player) -> None:
+        conn = self.clients[self.player_id_to_label[player_id]]
+        conn.send_pdu(pdu_builders.build_trigger_order(
+            seq_num=conn.next_seq(),
+            player_id=player_id,
+            trigger_ids=[t.trigger_id for t in triggers_for_player],
+        ))
+
     def _handle_trigger_order_response(self, label: str, conn: Connection, pdu: dict) -> None:
-        pass
+        if self._trigger_placement is None:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(), code="ILLEGAL_ACTION",
+                message="No TRIGGER_ORDER is currently pending.",
+                rejected_action=pdu))
+            return
+
+        player_id = getattr(conn, "player_id", None)
+        if player_id not in self._trigger_placement["awaiting_order_from"]:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(), code="ILLEGAL_ACTION",
+                message="No TRIGGER_ORDER is pending for you.",
+                rejected_action=pdu))
+            return
+
+        # RFC 5.4 / 10.2.11: seq_num must match the corresponding
+        # TRIGGER_ORDER's own seq_num -- this does not consume priority
+        # (RFC 8.6.2 NOTE), so a stale response gets a plain ERROR with no
+        # PRIORITY_GRANT re-issue (there is no grant to re-issue).
+        if conn.is_stale(pdu):
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(), code="STALE_ACTION",
+                message=(f"seq_num mismatch. Expected "
+                         f"{conn.expected_seq_for('TRIGGER_ORDER_RESPONSE')}, got {pdu.get('seq_num')}."),
+                rejected_action=pdu))
+            return
+
+        pending = self._trigger_placement["by_player"][player_id]
+        pending_by_id = {t.trigger_id: t for t in pending}
+        ordered_ids = pdu.get("ordered_trigger_ids")
+
+        # RFC 11 TRIGGER_ORDER_INVALID: "does not contain exactly the
+        # trigger IDs that were sent in the corresponding TRIGGER_ORDER".
+        if not isinstance(ordered_ids, list) or set(ordered_ids) != set(pending_by_id):
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(), code="TRIGGER_ORDER_INVALID",
+                message="ordered_trigger_ids must contain exactly the ids from TRIGGER_ORDER.",
+                rejected_action=pdu))
+            return
+
+        self._trigger_placement["by_player"][player_id] = [pending_by_id[tid] for tid in ordered_ids]
+        self._trigger_placement["awaiting_order_from"].discard(player_id)
+
+        if not self._trigger_placement["awaiting_order_from"]:
+            self._finish_trigger_ordering()
+
+    def _finish_trigger_ordering(self) -> None:
+        ap_id = self.game_state.active_player_id
+        nap = self.game_state.opponent_of(ap_id)
+        nap_id = nap.player_id if nap else None
+        by_player = self._trigger_placement["by_player"]
+        self._trigger_placement = None
+
+        # RFC 8.6.2 rules 1-2: the Active Player's triggers are placed on
+        # the Stack FIRST (so they resolve LAST, at the bottom); the
+        # Non-Active Player's are placed on top (resolve first). Pushing
+        # AP's before NAP's achieves exactly this (Stack = a list; the
+        # most recently appended item is the top -- RFC 8.3).
+        queue = list(by_player.get(ap_id, [])) + list(by_player.get(nap_id, []))
+        self._process_trigger_queue(queue)
+
+    def _process_trigger_queue(self, queue) -> None:
+        if not queue:
+            # RFC 8.6.1: "Priority MUST NOT be granted until all pending
+            # trigger ordering decisions and optional trigger choices
+            # have been resolved" -- they now have been.
+            recipient = self._trigger_priority_recipient
+            self._trigger_priority_recipient = None
+            if recipient is None:
+                self._open_priority_window()
+            else:
+                with self.lock:
+                    self._priority_passes = 0
+                    self.game_state.priority_holder_id = recipient
+                    conn = self.clients[self.player_id_to_label[recipient]]
+                conn.send_pdu(pdu_builders.build_priority_grant(
+                    seq_num=conn.next_seq(), player_id=recipient))
+            return
+
+        trigger, *rest = queue
+
+        if trigger.requires_target:
+            candidates = self._all_target_candidates()
+            if not candidates:
+                # RFC 8.6.4: "If no legal targets exist, the trigger is
+                # discarded immediately with no effect."
+                self._process_trigger_queue(rest)
+                return
+        else:
+            candidates = []
+
+        if trigger.requires_target or trigger.optional:
+            # RFC 8.6.3/8.6.4: a target-requiring and/or optional trigger
+            # needs a TRIGGER_CHOICE round trip before it can be placed.
+            self._trigger_choice_pending = {"trigger": trigger, "rest": rest}
+            conn = self.clients[self.player_id_to_label[trigger.controller_id]]
+            conn.send_pdu(pdu_builders.build_trigger_choice(
+                seq_num=conn.next_seq(),
+                trigger_id=trigger.trigger_id,
+                source_id=trigger.source_id,
+                effect_summary=trigger.summary,
+                requires_target=trigger.requires_target,
+                legal_targets=candidates,
+            ))
+            return
+
+        # Mandatory, no target needed -- straight onto the Stack.
+        self._push_trigger(trigger)
+        self._process_trigger_queue(rest)
 
     def _handle_trigger_choice_response(self, label: str, conn: Connection, pdu: dict) -> None:
-        pass
+        if self._trigger_choice_pending is None:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(), code="ILLEGAL_ACTION",
+                message="No TRIGGER_CHOICE is currently pending.",
+                rejected_action=pdu))
+            return
+
+        trigger = self._trigger_choice_pending["trigger"]
+        player_id = getattr(conn, "player_id", None)
+        if player_id != trigger.controller_id:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(), code="ILLEGAL_ACTION",
+                message="No TRIGGER_CHOICE is pending for you.",
+                rejected_action=pdu))
+            return
+
+        if conn.is_stale(pdu):
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(), code="STALE_ACTION",
+                message=(f"seq_num mismatch. Expected "
+                         f"{conn.expected_seq_for('TRIGGER_CHOICE_RESPONSE')}, got {pdu.get('seq_num')}."),
+                rejected_action=pdu))
+            return
+
+        # RFC 11 TRIGGER_CHOICE_INVALID: "references an unknown
+        # trigger_id, or chosen_target is absent when a target is
+        # required."
+        if pdu.get("trigger_id") != trigger.trigger_id:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(), code="TRIGGER_CHOICE_INVALID",
+                message="trigger_id does not match the pending TRIGGER_CHOICE.",
+                rejected_action=pdu))
+            return
+
+        accept = pdu.get("accept")
+        chosen_target = pdu.get("chosen_target")
+
+        # A mandatory trigger's TRIGGER_CHOICE exists only to gather a
+        # target (RFC 8.6.4) -- there is no real "decline" option, since
+        # RFC 8.6.3's accept=false path is specifically for "you may"
+        # triggers.
+        if not trigger.optional and accept is not True:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(), code="TRIGGER_CHOICE_INVALID",
+                message="This trigger is mandatory and cannot be declined.",
+                rejected_action=pdu))
+            return
+
+        if accept and trigger.requires_target:
+            candidates = self._all_target_candidates()
+            if chosen_target is None or chosen_target not in candidates:
+                conn.send_pdu(pdu_builders.build_error(
+                    seq_num=conn.next_seq(), code="TRIGGER_CHOICE_INVALID",
+                    message="chosen_target is missing or not a legal target.",
+                    rejected_action=pdu))
+                return
+
+        rest = self._trigger_choice_pending["rest"]
+        self._trigger_choice_pending = None
+
+        if accept:
+            self._push_trigger(trigger, target=chosen_target if trigger.requires_target else None)
+
+        self._process_trigger_queue(rest)
+
+    def _push_trigger(self, trigger, target=None) -> None:
+        with self.lock:
+            item = StackItem(
+                stack_item_id=self._next_stack_item_id(),
+                item_type=StackItemType.TRIGGER_ABILITY,
+                source_id=trigger.source_id,
+                controller_id=trigger.controller_id,
+                targets=[target] if target else [],
+            )
+            self.game_state.push_stack_item(item)
+            recipients = [self.clients[self.player_id_to_label[pid]]
+                          for pid in self.game_state.players]
+
+        for c in recipients:
+            c.send_pdu(pdu_builders.build_stack_push(seq_num=c.next_seq(), stack_item=item))
 
     def _handle_declare_attackers(self, label: str, conn: Connection, pdu: dict) -> None:
         pass
