@@ -5,16 +5,16 @@ import threading
 from network import protocol
 from network.protocol import (Connection, ConnectionClosed, ProtocolError, log)
 
-from model.phase import Phase
-from model.player import player
-from model.creature import creature
+from model.Phase import Phase
+from model.Player import player
+from model.Creature import creature
 from model.artifact import artifact
 from model.enchantment import enchantment
 from model.instant import instant
 from model.sorcery import sorcery
 
 MAX_PLAYERS = 2
-
+LOBBY, SETUP, IN_GAME = "LOBBY", "SETUP", "IN_GAME"
 
 class GameServer:
     def __init__(self, host: str, port: int, verbose: bool):
@@ -25,6 +25,7 @@ class GameServer:
         self.lock = threading.Lock()
         # controls flow of game
         self.session = GameSession()
+        self.state = LOBBY
 
         # handler table to call the corresponding method of each pdu type
         self._handlers = {
@@ -131,7 +132,17 @@ class GameServer:
 
     ### HANDLERS ###
     def _handle_player_ready(self, label: str, conn: Connection, pdu: dict) -> None:
-        pass
+        if self.state != LOBBY:
+            conn.send_pdu({
+                "type": "ERROR",
+                "code": "WRONG_PHASE",
+                "message": "PLAYER_READY is only valid in the LOBBY state",
+            })
+        else:
+            player_id = pdu.get("player_id")
+            deck_list = pdu.get("deck_list")
+
+            ## TODO: Implement Deck Validation
 
     def _handle_mulligan_choice(self, label: str, conn: Connection, pdu: dict) -> None:
         pass
