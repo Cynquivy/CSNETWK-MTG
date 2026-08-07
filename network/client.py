@@ -7,8 +7,21 @@ from network.protocol import (Connection, ConnectionClosed, ProtocolError, log)
 
 seq_num = 1
 
-def _handle_game_state_update(label: str, conn: Connection, pdu: dict) -> None:
-    pass
+def _handle_game_state_update(conn: Connection, pdu: dict) -> None:
+    state = pdu.get("state")
+    phase = state.get("phase")
+
+    if phase == "LOBBY":
+        ready = state.get("players_ready", 0)
+        waiting_for = state.get("waiting_for", [])
+
+        log(f"[client] LOBBY: {ready}/2 players ready")
+        for name in waiting_for:
+            log(f"[client]   waiting on: {name}")
+
+    elif phase == "SETUP":
+        log(f"[client] SETUP: Initializing game state, validating decks, and drawing opening hands...")
+        # TODO: handle mulligan-relevant fields
 
 def _handle_phase_transition(label: str, conn: Connection, pdu: dict) -> None:
     pass
@@ -106,6 +119,26 @@ def send_player_ready(conn: Connection, player_id: str, deck_list: list) -> None
     })
 
     seq_num += 1
+
+    receive_and_handle(conn)
+
+def send_mulligan_choice(conn: Connection, hand: list, last_game_state_seq: int, mulligan_count: int) -> None:
+    log(f"[client] your hand ({len(hand)} cards): {hand}")
+    log(f"[client] you have mulliganed {mulligan_count} time(s) so far")
+
+    choice = input("[client] keep this hand? (y/n): ").strip().lower()
+    keep = choice in ("y", "yes")
+
+    cards_to_bottom = []
+
+    # TODO: implement mulligan logic
+            
+    conn.send_pdu({
+        "type": "MULLIGAN_CHOICE",
+        "seq_num": last_game_state_seq,   # echoes the setup/redraw GAME_STATE_UPDATE
+        "keep": keep,
+        "cards_to_bottom": cards_to_bottom,
+    })
 
     receive_and_handle(conn)
 
