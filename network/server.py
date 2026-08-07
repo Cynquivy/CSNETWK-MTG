@@ -5,9 +5,9 @@ import threading
 from network import protocol
 from network.protocol import (Connection, ConnectionClosed, ProtocolError, log)
 
-from model.Phase import Phase
-from model.Player import player
-from model.Creature import creature
+from model.phase import Phase
+from model.player import player
+from model.creature import creature
 from model.artifact import artifact
 from model.enchantment import enchantment
 from model.instant import instant
