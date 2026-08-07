@@ -4,6 +4,7 @@ import threading
 
 from network import protocol
 from network.protocol import (Connection, ConnectionClosed, ProtocolError, log)
+from network import pdu as pdu_builders
 
 from model.phase import Phase
 from model.player import player
@@ -12,9 +13,15 @@ from model.artifact import artifact
 from model.enchantment import enchantment
 from model.instant import instant
 from model.sorcery import sorcery
+# Aliased: this file also defines its own (dead, unreachable -- see
+# GameController below) in-file `class GameState`, later in this same
+# module. Since that class definition executes at module-load time, it
+# would silently overwrite an unaliased `GameState` import in this
+# module's namespace before any method ever ran.
+from model.game_state import GameState as ModelGameState
+from model.lifecycle import LifecycleState
 
 MAX_PLAYERS = 2
-LOBBY, SETUP, IN_GAME = "LOBBY", "SETUP", "IN_GAME"
 
 class GameServer:
     def __init__(self, host: str, port: int, verbose: bool):
@@ -25,7 +32,27 @@ class GameServer:
         self.lock = threading.Lock()
         # controls flow of game
         self.session = GameSession()
-        self.state = LOBBY
+
+        # RFC 0001 Section 4.2: the server's single authoritative Game
+        # State (model/game_state.py, Milestone #3). Starts in LOBBY
+        # (RFC 6.2: "The server enters the LOBBY state upon startup").
+        # This replaces the old ad-hoc self.state = "LOBBY" string tracker
+        # -- that only modeled 3 states (LOBBY/SETUP/IN_GAME) where the
+        # RFC's own Section 6.1 lifecycle machine has 5 (LOBBY/GAME_SETUP/
+        # MULLIGAN/IN_GAME/GAME_OVER).
+        self.game_state = ModelGameState()
+
+        # LOBBY-only bookkeeping (RFC 6.2), reset whenever the server
+        # re-enters LOBBY (on startup, and after every GAME_OVER --
+        # Milestone #14). player_id -> deck_list, for players who have
+        # submitted a *valid* PLAYER_READY but the game hasn't started yet
+        # -- GAME_SETUP (Milestone #7) is what turns these into real
+        # Player objects and shuffles/deals.
+        self.pending_decks = {}
+        # player_id -> connection label ("P1"/"P2"), so a resubmission
+        # from the SAME connection can be told apart from a genuine
+        # DUPLICATE_ID claimed by a DIFFERENT connection (RFC 6.2).
+        self.player_id_to_label = {}
 
         # handler table to call the corresponding method of each pdu type
         self._handlers = {
@@ -132,17 +159,107 @@ class GameServer:
 
     ### HANDLERS ###
     def _handle_player_ready(self, label: str, conn: Connection, pdu: dict) -> None:
-        if self.state != LOBBY:
-            conn.send_pdu({
-                "type": "ERROR",
-                "code": "WRONG_PHASE",
-                "message": "PLAYER_READY is only valid in the LOBBY state",
-            })
-        else:
-            player_id = pdu.get("player_id")
-            deck_list = pdu.get("deck_list")
+        # RFC 6.1/6.2: PLAYER_READY is only meaningful while the server is
+        # in the LOBBY state.
+        if self.game_state.lifecycle_state != LifecycleState.LOBBY:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="WRONG_PHASE",
+                message="PLAYER_READY is only valid in the LOBBY state.",
+                rejected_action=pdu,
+            ))
+            return
 
-            ## TODO: Implement Deck Validation
+        player_id = pdu.get("player_id")
+        deck_list = pdu.get("deck_list")
+
+        # RFC 6.2: "The player_id field in PLAYER_READY is client-chosen
+        # and MUST be a non-empty string." No RFC error code is dedicated
+        # to this specific violation; ILLEGAL_ACTION ("syntactically valid
+        # but violates game rules", RFC 11) is the closest defined fit.
+        if not isinstance(player_id, str) or not player_id:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="ILLEGAL_ACTION",
+                message="player_id must be a non-empty string.",
+                rejected_action=pdu,
+            ))
+            return
+
+        deck_error = player.validate_deck(deck_list)
+
+        with self.lock:
+            claimed_by = self.player_id_to_label.get(player_id)
+            # RFC 6.2: rejected only if the id is already claimed by the
+            # OTHER connected player -- the SAME connection resubmitting
+            # under an id it already holds is the explicitly-allowed
+            # replace-before-ready case handled below, not a duplicate.
+            duplicate = claimed_by is not None and claimed_by != label
+
+            if not duplicate and deck_error is None:
+                # RFC 6.2: "A player MAY send a subsequent PLAYER_READY in
+                # the LOBBY state before both players are ready; the
+                # server MUST replace the earlier submission." If this
+                # connection previously registered a different player_id,
+                # drop that stale mapping first.
+                for old_id, old_label in list(self.player_id_to_label.items()):
+                    if old_label == label and old_id != player_id:
+                        del self.player_id_to_label[old_id]
+                        self.pending_decks.pop(old_id, None)
+
+                self.player_id_to_label[player_id] = label
+                self.pending_decks[player_id] = deck_list
+                conn.player_id = player_id
+
+            both_ready = len(self.pending_decks) >= MAX_PLAYERS
+            players_ready = len(self.pending_decks)
+            ready_labels = set(self.player_id_to_label.values())
+            # RFC 6.2's own worked example lists the not-yet-ready
+            # opponent's eventual player_id ("waiting_for": ["player_2"]),
+            # but that id is entirely client-chosen and genuinely unknown
+            # to the server until that PDU actually arrives -- there is no
+            # way to predict it in general. Using the connection label
+            # ("P1"/"P2") as a placeholder is the closest honest
+            # approximation available before that player has readied up.
+            waiting_for = [l for l in self.clients if l not in ready_labels]
+
+            if not duplicate and deck_error is None and both_ready:
+                # RFC 6.2: "When both players have sent a valid
+                # PLAYER_READY PDU, the server transitions to GAME_SETUP."
+                # GAME_SETUP's own procedure (shuffle/deal/coin-flip, RFC
+                # 6.3) is Milestone #7's job.
+                self.game_state.lifecycle_state = LifecycleState.GAME_SETUP
+
+        if duplicate:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="DUPLICATE_ID",
+                message=f"player_id '{player_id}' is already claimed by the other player.",
+                rejected_action=pdu,
+            ))
+            return
+
+        if deck_error is not None:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="ILLEGAL_DECK",
+                message=deck_error,
+                rejected_action=pdu,
+            ))
+            return
+
+        log(f"[server] {label} ready as '{player_id}' "
+            f"({players_ready}/{MAX_PLAYERS} players ready)")
+
+        if both_ready:
+            log("[server] both players ready -- transitioning to GAME_SETUP (Milestone #7)")
+            return
+
+        conn.send_pdu(pdu_builders.build_game_state_update_lobby(
+            seq_num=conn.next_seq(),
+            players_ready=players_ready,
+            waiting_for=waiting_for,
+        ))
 
     def _handle_mulligan_choice(self, label: str, conn: Connection, pdu: dict) -> None:
         pass

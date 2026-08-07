@@ -20,23 +20,45 @@ class player:
         self.has_priority = False
         self.land_played_this_turn = False  # RFC 10.2.2 field name; reset every Untap Step (RFC 7.2)
     
-    def validate_deck(self, deck_list: list):
+    @staticmethod
+    def validate_deck(deck_list):
+        """
+        RFC 0001 Section 6.3 step 1 / Section 11 ILLEGAL_DECK: "The
+        submitted deck_list is empty, contains more than 50 cards, or
+        includes one or more cards not in the legal card set." A
+        staticmethod (no self) so LOBBY handling can validate a deck
+        before any Player object exists (RFC 6.2: decks are validated at
+        PLAYER_READY time, before GAME_SETUP ever constructs a player).
+
+        Returns None if legal, or a human-readable reason string
+        otherwise -- the ILLEGAL_DECK example in RFC 6.2 ("Deck contains
+        51 cards; maximum is 50.") is a specific message, not just a
+        boolean, so callers need the reason to report it faithfully.
+
+        Duplicate card_id entries are also rejected, even though not
+        spelled out verbatim in the ILLEGAL_DECK definition above: each
+        card_id in the fixed catalog (docs/mtgnp_master_card_list.xlsx,
+        "Card Instances") names one unique physical card instance, so
+        repeating an id would mean claiming two copies of the exact same
+        physical card, which the fixed 312-card set does not allow.
+        """
+        if not isinstance(deck_list, list) or len(deck_list) == 0:
+            return "Deck is empty; minimum is 1 card."
+        if len(deck_list) > 50:
+            return f"Deck contains {len(deck_list)} cards; maximum is 50."
+
         cards_seen = set()
-        valid = True
-        
         for card_id in deck_list:
-            if valid:
-                if card_id not in card_database.CARD_DATABASE:
-                    valid = False               # CARD DOES NOT EXIST
-                elif card_id in cards_seen:
-                    valid = False               # THERE IS A DUPLICATE CARD
-                else:
-                    cards_seen.add(card_id)     # ADD CARD TO SEEN
-        
-        return valid
-    
+            if card_id not in card_database.CARD_DATABASE:
+                return f"'{card_id}' is not a card in the fixed card set."
+            if card_id in cards_seen:
+                return f"'{card_id}' appears more than once in the deck."
+            cards_seen.add(card_id)
+
+        return None
+
     def initialize_library(self, deck_list: list):
-        if self.validate_deck(deck_list):
+        if player.validate_deck(deck_list) is None:
             self.deck_list = deck_list
             self.library = list(self.deck_list)
             random.shuffle(self.library)
