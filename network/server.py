@@ -7,7 +7,7 @@ from network import protocol
 from network.protocol import (Connection, ConnectionClosed, ProtocolError, log)
 from network import pdu as pdu_builders
 
-from model.phase import Phase
+from model.phase import Phase, TURN_SEQUENCE
 from model.player import player
 from model.creature import creature
 from model.artifact import artifact
@@ -54,6 +54,12 @@ class GameServer:
         # from the SAME connection can be told apart from a genuine
         # DUPLICATE_ID claimed by a DIFFERENT connection (RFC 6.2).
         self.player_id_to_label = {}
+
+        # RFC 8.1 rule 6: server-internal bookkeeping (not part of the
+        # RFC's own wire-visible GameState) tracking how many consecutive
+        # PRIORITY_PASS PDUs have been received for the currently open
+        # priority window. Reset to 0 every time a new window opens.
+        self._priority_passes = 0
 
         # handler table to call the corresponding method of each pdu type
         self._handlers = {
@@ -427,11 +433,7 @@ class GameServer:
         """
         RFC 6.4: "When both players have sent MULLIGAN_CHOICE with keep:
         true, the server transitions to IN_GAME and begins the first
-        player's turn." RFC 6.5: the turn counter is set to 1 here. Stops
-        at the single PHASE_TRANSITION(MULLIGAN -> UNTAP) broadcast that
-        bridges the two states (matching Examples.pdf's own Step 11) --
-        actually executing the Untap Step's body (untap permanents, open
-        Upkeep's priority window, ...) is Milestone #8's turn engine.
+        player's turn." RFC 6.5: the turn counter is set to 1 here.
         """
         with self.lock:
             if self.game_state.lifecycle_state != LifecycleState.MULLIGAN:
@@ -457,12 +459,237 @@ class GameServer:
                 turn=1,
             ))
 
-        log(f"[server] both players kept -- IN_GAME turn 1, "
-            f"active_player={active_player_id} "
-            f"(Milestone #8 takes over turn/phase execution from here)")
+        log(f"[server] both players kept -- IN_GAME turn 1, active_player={active_player_id}")
+        self._run_phase_entry(Phase.UNTAP)
+
+    ### TURN / PHASE ENGINE (RFC Section 7, Figure 4) ###
+    #
+    # _advance_phase() moves the turn engine forward one step in
+    # model.phase.TURN_SEQUENCE (wrapping Cleanup -> next turn's Untap)
+    # and broadcasts the PHASE_TRANSITION for that move; _run_phase_entry()
+    # then performs whatever automatic action (if any) that newly-entered
+    # step requires, per RFC Section 7's per-step descriptions.
+    #
+    # Steps with no priority window (Untap; Cleanup's no-discard-needed
+    # fast path) call _advance_phase() again immediately when done, per
+    # RFC 7.2's "transition immediately" -- so a single PRIORITY_PASS can
+    # cascade through several silent steps before the next PRIORITY_GRANT
+    # is actually sent.
+    #
+    # DECLARE_ATTACKERS onward (the rest of the Combat Phase sub-state
+    # machine, RFC Section 9) is Milestone #12's job: TURN_SEQUENCE
+    # already knows the correct order for those steps too, but no handler
+    # yet drives the engine through them -- _run_phase_entry() broadcasts
+    # their PHASE_TRANSITION (RFC 9.3: that broadcast IS the signal, "no
+    # separate request PDU is defined") and then legitimately stops,
+    # exactly as it does today while waiting on a real player.
+
+    def _advance_phase(self) -> None:
+        with self.lock:
+            current_phase = self.game_state.phase
+            current_index = TURN_SEQUENCE.index(current_phase)
+            at_end_of_turn = current_index == len(TURN_SEQUENCE) - 1
+            next_phase = TURN_SEQUENCE[0] if at_end_of_turn else TURN_SEQUENCE[current_index + 1]
+
+            self.game_state.phase = next_phase
+            self.game_state.priority_holder_id = None  # RFC 10.2.2: null outside a priority window
+            self._priority_passes = 0
+
+            active_player_id = self.game_state.active_player_id
+            turn = self.game_state.turn
+            recipients = [self.clients[self.player_id_to_label[pid]]
+                          for pid in self.game_state.players]
+
+        for conn in recipients:
+            conn.send_pdu(pdu_builders.build_phase_transition(
+                seq_num=conn.next_seq(),
+                from_phase=current_phase,
+                to_phase=next_phase,
+                active_player_id=active_player_id,
+                turn=turn,
+            ))
+
+        self._run_phase_entry(next_phase)
+
+    def _run_phase_entry(self, phase) -> None:
+        if phase is Phase.UNTAP:
+            self._run_untap_step()
+        elif phase is Phase.DRAW:
+            self._run_draw_step()
+        elif phase is Phase.CLEANUP:
+            self._run_cleanup_step()
+        elif phase in (Phase.UPKEEP, Phase.PRECOMBAT_MAIN, Phase.BEGIN_COMBAT,
+                       Phase.POSTCOMBAT_MAIN, Phase.END_STEP):
+            # RFC 7.3 / 7.5 / 9.2 / 7.7: no automatic action -- just open a
+            # priority window with the Active Player first (RFC 8.1 rule 1).
+            self._open_priority_window()
+        # else: DECLARE_ATTACKERS and later (Milestone #12). Nothing to do
+        # here; the PHASE_TRANSITION already broadcast above is the only
+        # signal RFC 9.3 defines for that step.
+
+    def _run_untap_step(self) -> None:
+        """RFC 7.2: untap the Active Player's permanents, reset their land
+        drop, broadcast the result, then move on with no priority window."""
+        with self.lock:
+            active = self.game_state.active_player
+            for permanent in active.board:
+                permanent.is_tapped = False
+            active.land_played_this_turn = False
+            recipients = [(pid, self.clients[self.player_id_to_label[pid]])
+                          for pid in self.game_state.players]
+
+        for player_id, conn in recipients:
+            conn.send_pdu(pdu_builders.build_game_state_update_in_game(
+                seq_num=conn.next_seq(),
+                game_state=self.game_state,
+                viewer_player_id=player_id,
+            ))
+
+        self._advance_phase()
+
+    def _run_draw_step(self) -> None:
+        """RFC 7.4: draw one card for the Active Player, except on the very
+        first turn of the game, where no card is drawn but the
+        PHASE_TRANSITION and priority window still happen normally."""
+        with self.lock:
+            active = self.game_state.active_player
+            skip_draw = self.game_state.turn == 1
+            drew_successfully = True
+            if not skip_draw:
+                drew_successfully = active.draw_from_lib(1)
+            conn = self.clients[self.player_id_to_label[active.player_id]]
+
+        if not drew_successfully:
+            # RFC 6.5: "A player is required to draw a card from an empty
+            # library" is an IN_GAME loss condition. Detecting it here so
+            # the engine does not silently continue as if the draw
+            # succeeded; broadcasting GAME_OVER for it is Milestone #14's
+            # job, so the turn engine intentionally halts rather than
+            # opening a priority window on top of an unresolved loss.
+            log(f"[server] {active.player_id} must draw from an empty library "
+                f"-- GAME_OVER handling is Milestone #14, halting here")
+            return
+
+        if not skip_draw:
+            conn.send_pdu(pdu_builders.build_game_state_update_in_game(
+                seq_num=conn.next_seq(),
+                game_state=self.game_state,
+                viewer_player_id=active.player_id,
+            ))
+
+        self._open_priority_window()
+
+    def _run_cleanup_step(self) -> None:
+        """RFC 7.8: discard down to 7 if needed (Milestone #13 supplies the
+        actual DISCARD handling and resumes from here); otherwise clear
+        damage/until-end-of-turn effects, advance the turn counter, flip
+        the Active Player, and begin the next turn's Untap Step."""
+        with self.lock:
+            active = self.game_state.active_player
+            needs_discard = len(active.hand) > 7
+            conn = self.clients[self.player_id_to_label[active.player_id]] if needs_discard else None
+
+        if needs_discard:
+            conn.send_pdu(pdu_builders.build_game_state_update_in_game(
+                seq_num=conn.next_seq(),
+                game_state=self.game_state,
+                viewer_player_id=active.player_id,
+            ))
+            log(f"[server] {active.player_id} must discard to 7 "
+                f"-- awaiting DISCARD (Milestone #13)")
+            return
+
+        with self.lock:
+            for p in self.game_state.players.values():
+                for permanent in p.board:
+                    if isinstance(permanent, creature):
+                        permanent.damage_marked = 0
+                        permanent.power = permanent.base_power
+                        permanent.toughness = permanent.base_toughness
+
+            recipients = [(pid, self.clients[self.player_id_to_label[pid]])
+                          for pid in self.game_state.players]
+
+        for player_id, conn2 in recipients:
+            conn2.send_pdu(pdu_builders.build_game_state_update_in_game(
+                seq_num=conn2.next_seq(),
+                game_state=self.game_state,
+                viewer_player_id=player_id,
+            ))
+
+        with self.lock:
+            self.game_state.turn += 1
+            self.game_state.active_player_id = self.game_state.opponent_of(
+                self.game_state.active_player_id).player_id
+
+        self._advance_phase()
+
+    def _open_priority_window(self) -> None:
+        """RFC 8.1 rule 1: the Active Player receives priority first at the
+        start of every step that grants a priority window."""
+        with self.lock:
+            self._priority_passes = 0
+            self.game_state.priority_holder_id = self.game_state.active_player_id
+            conn = self.clients[self.player_id_to_label[self.game_state.active_player_id]]
+
+        conn.send_pdu(pdu_builders.build_priority_grant(
+            seq_num=conn.next_seq(),
+            player_id=self.game_state.active_player_id,
+        ))
 
     def _handle_priority_pass(self, label: str, conn: Connection, pdu: dict) -> None:
-        pass
+        if self.game_state.lifecycle_state != LifecycleState.IN_GAME:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="WRONG_PHASE",
+                message="PRIORITY_PASS is only valid during IN_GAME.",
+                rejected_action=pdu,
+            ))
+            return
+
+        player_id = getattr(conn, "player_id", None)
+        if player_id != self.game_state.priority_holder_id:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="NOT_YOUR_PRIORITY",
+                message="You do not currently hold priority.",
+                rejected_action=pdu,
+            ))
+            return
+
+        if conn.is_stale(pdu):
+            error, grant = conn.build_stale_action_response(pdu, player_id=player_id)
+            conn.send_pdu(error)
+            conn.send_pdu(grant)
+            return
+
+        advance = False
+        next_holder_id = None
+        next_holder_conn = None
+
+        with self.lock:
+            self._priority_passes += 1
+            # RFC 8.1 rule 6: both players passed consecutively with an
+            # empty stack -> the step ends. (A non-empty stack would
+            # instead resolve its top item per rule 5 -- Milestone #9;
+            # the stack cannot yet be non-empty since nothing pushes to
+            # it until CAST_SPELL/ACTIVATE_ABILITY are implemented.)
+            if self._priority_passes >= 2 and self.game_state.stack_is_empty:
+                advance = True
+            else:
+                # RFC 8.1 rule 4: priority passes to the other player.
+                opponent = self.game_state.opponent_of(player_id)
+                next_holder_id = opponent.player_id
+                self.game_state.priority_holder_id = next_holder_id
+                next_holder_conn = self.clients[self.player_id_to_label[next_holder_id]]
+
+        if advance:
+            self._advance_phase()
+        else:
+            next_holder_conn.send_pdu(pdu_builders.build_priority_grant(
+                seq_num=next_holder_conn.next_seq(),
+                player_id=next_holder_id,
+            ))
 
     def _handle_cast_spell(self, label: str, conn: Connection, pdu: dict) -> None:
         pass
