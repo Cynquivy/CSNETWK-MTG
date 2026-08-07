@@ -14,6 +14,9 @@ from model.artifact import artifact
 from model.enchantment import enchantment
 from model.instant import instant
 from model.sorcery import sorcery
+from model.card_database import card_database
+from model.stack import StackItem, StackItemType
+from model.mana import payment_covers_cost
 # Aliased: this file also defines its own (dead, unreachable -- see
 # GameController below) in-file `class GameState`, later in this same
 # module. Since that class definition executes at module-load time, it
@@ -60,6 +63,8 @@ class GameServer:
         # PRIORITY_PASS PDUs have been received for the currently open
         # priority window. Reset to 0 every time a new window opens.
         self._priority_passes = 0
+        # RFC 8.3: server-assigned unique Stack item ids ("stk_01", ...).
+        self._stack_id_counter = 0
 
         # handler table to call the corresponding method of each pdu type
         self._handlers = {
@@ -664,18 +669,20 @@ class GameServer:
             return
 
         advance = False
+        resolve = False
         next_holder_id = None
         next_holder_conn = None
 
         with self.lock:
             self._priority_passes += 1
-            # RFC 8.1 rule 6: both players passed consecutively with an
-            # empty stack -> the step ends. (A non-empty stack would
-            # instead resolve its top item per rule 5 -- Milestone #9;
-            # the stack cannot yet be non-empty since nothing pushes to
-            # it until CAST_SPELL/ACTIVATE_ABILITY are implemented.)
-            if self._priority_passes >= 2 and self.game_state.stack_is_empty:
-                advance = True
+            if self._priority_passes >= 2:
+                if self.game_state.stack_is_empty:
+                    # RFC 8.1 rule 6: step ends, move to the next step.
+                    advance = True
+                else:
+                    # RFC 8.1 rule 5: resolve the top Stack item, then
+                    # re-grant priority to the Active Player.
+                    resolve = True
             else:
                 # RFC 8.1 rule 4: priority passes to the other player.
                 opponent = self.game_state.opponent_of(player_id)
@@ -685,17 +692,326 @@ class GameServer:
 
         if advance:
             self._advance_phase()
+        elif resolve:
+            self._resolve_top_of_stack()
         else:
             next_holder_conn.send_pdu(pdu_builders.build_priority_grant(
                 seq_num=next_holder_conn.next_seq(),
                 player_id=next_holder_id,
             ))
 
+    def _next_stack_item_id(self) -> str:
+        self._stack_id_counter += 1
+        return f"stk_{self._stack_id_counter:02d}"
+
+    def _targets_still_legal(self, targets) -> bool:
+        """
+        RFC 8.4 step 2 / ERROR code ILLEGAL_TARGET: a target is legal if
+        it names a still-seated player or a permanent currently on some
+        player's battlefield. This card set has no per-effect target-type
+        metadata yet (e.g. "target creature" vs "any target" vs "target
+        player"), so this is a structural existence check only -- real
+        per-effect target restrictions are Milestone #19's job once
+        actual card effects (and their target types) exist.
+        """
+        with self.lock:
+            permanent_ids = {c.card_id for p in self.game_state.players.values() for c in p.board}
+            player_ids = set(self.game_state.players.keys())
+        return all(t in player_ids or t in permanent_ids for t in targets)
+
+    def _check_state_based_actions(self) -> bool:
+        """
+        RFC 8.4: checked after every game event, before any priority is
+        granted. Applies repeatedly until stable: creatures with lethal
+        damage or non-positive toughness die; a player at 0 or less life
+        loses (simultaneous zero-life: the Active Player loses, RFC 8.4).
+        Placing resulting triggers on the Stack is Milestone #10's job
+        (no trigger detection exists yet, so there is nothing to place).
+
+        Returns True if a game-ending condition was found. Actually
+        broadcasting GAME_OVER and resetting to LOBBY is Milestone #14's
+        job (same boundary as the empty-library check in
+        GameServer._run_draw_step) -- this only detects and logs, so
+        callers know to stop advancing as if nothing happened.
+        """
+        with self.lock:
+            changed = True
+            while changed:
+                changed = False
+                for p in self.game_state.players.values():
+                    dead = [c for c in p.board if isinstance(c, creature)
+                            and (c.toughness <= 0 or c.damage_marked >= c.toughness)]
+                    for c in dead:
+                        p.board.remove(c)
+                        p.graveyard.append(c.card_id)
+                        changed = True
+
+            losers = [pid for pid, p in self.game_state.players.items() if p.life <= 0]
+            active_id = self.game_state.active_player_id
+
+        if not losers:
+            return False
+
+        # RFC 8.4: "If both players' life totals reach zero or less
+        # simultaneously ... the Active Player loses and the Non-Active
+        # Player wins."
+        loser_id = active_id if len(losers) == 2 else losers[0]
+        winner_id = self.game_state.opponent_of(loser_id).player_id
+        log(f"[server] LIFE_ZERO: {loser_id} has lost, {winner_id} would win "
+            f"-- GAME_OVER broadcast + LOBBY reset is Milestone #14, halting here")
+        return True
+
+    def _resolve_top_of_stack(self) -> None:
+        """
+        RFC 8.4 steps 1-4: pop the top Stack item, re-check target
+        legality, apply the effect (or fizzle), broadcast STACK_RESOLVE,
+        run state-based actions, broadcast the resulting GAME_STATE_UPDATE,
+        then re-grant priority to the Active Player.
+        """
+        with self.lock:
+            item = self.game_state.pop_stack_item()
+
+        # _targets_still_legal() acquires self.lock itself (threading.Lock
+        # is not reentrant), so it must be called outside the block above.
+        legal = self._targets_still_legal(item.targets)
+        # Milestone #19: real per-card effect application plugs in here
+        # once card effects exist. No effect is implemented yet -- see
+        # model/creature.py, instant.py, sorcery.py -- so a legal-target
+        # resolution is currently a structural no-op: this milestone
+        # delivers the resolution MECHANISM (push, target re-check, pop,
+        # broadcast, SBA check, re-grant), not any specific card's effect.
+        state_changes = []
+        result = "RESOLVED" if legal else "FIZZLE"
+
+        with self.lock:
+            recipients = [self.clients[self.player_id_to_label[pid]]
+                          for pid in self.game_state.players]
+
+        for conn in recipients:
+            conn.send_pdu(pdu_builders.build_stack_resolve(
+                seq_num=conn.next_seq(),
+                stack_item_id=item.stack_item_id,
+                result=result,
+                state_changes=state_changes,
+            ))
+
+        game_over = self._check_state_based_actions()
+
+        with self.lock:
+            recipients2 = [(pid, self.clients[self.player_id_to_label[pid]])
+                           for pid in self.game_state.players]
+        for player_id, conn in recipients2:
+            conn.send_pdu(pdu_builders.build_game_state_update_in_game(
+                seq_num=conn.next_seq(),
+                game_state=self.game_state,
+                viewer_player_id=player_id,
+            ))
+
+        if game_over:
+            return
+
+        # RFC 8.1 rule 5: "The Active Player then receives priority again."
+        self._open_priority_window()
+
     def _handle_cast_spell(self, label: str, conn: Connection, pdu: dict) -> None:
-        pass
+        if self.game_state.lifecycle_state != LifecycleState.IN_GAME:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(), code="WRONG_PHASE",
+                message="CAST_SPELL is only valid during IN_GAME.",
+                rejected_action=pdu))
+            return
+
+        player_id = getattr(conn, "player_id", None)
+        caster = self.game_state.players.get(player_id)
+        if caster is None:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(), code="ILLEGAL_ACTION",
+                message="No registered player for this connection.",
+                rejected_action=pdu))
+            return
+
+        # RFC 8.1 rule 2: only whoever currently holds priority may act --
+        # this may be the Non-Active Player responding with an instant.
+        if player_id != self.game_state.priority_holder_id:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(), code="NOT_YOUR_PRIORITY",
+                message="You do not currently hold priority.",
+                rejected_action=pdu))
+            return
+
+        if conn.is_stale(pdu):
+            error, grant = conn.build_stale_action_response(pdu, player_id=player_id)
+            conn.send_pdu(error)
+            conn.send_pdu(grant)
+            return
+
+        card_id = pdu.get("card_id")
+        targets = pdu.get("targets") or []
+        mana_payment = pdu.get("mana_payment") or {}
+
+        if card_id not in caster.hand:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(), code="ILLEGAL_ACTION",
+                message=f"'{card_id}' is not in your hand.",
+                rejected_action=pdu))
+            return
+
+        spell = card_database.CARD_DATABASE.get(card_id)
+        if spell is None:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(), code="ILLEGAL_ACTION",
+                message=f"'{card_id}' is not a card in the fixed card set.",
+                rejected_action=pdu))
+            return
+
+        # RFC 7.5: non-instants are sorcery-speed -- Active Player only,
+        # Main Phase only, empty stack only. RFC 11 WRONG_PHASE's own
+        # example is literally "casting a sorcery outside a Main Phase".
+        if not isinstance(spell, instant):
+            sorcery_speed_ok = (
+                player_id == self.game_state.active_player_id
+                and self.game_state.phase in (Phase.PRECOMBAT_MAIN, Phase.POSTCOMBAT_MAIN)
+                and self.game_state.stack_is_empty
+            )
+            if not sorcery_speed_ok:
+                conn.send_pdu(pdu_builders.build_error(
+                    seq_num=conn.next_seq(), code="WRONG_PHASE",
+                    message="Non-instant spells may only be cast by the Active "
+                            "Player, at sorcery speed, with an empty stack.",
+                    rejected_action=pdu))
+                return
+
+        if not self._targets_still_legal(targets):
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(), code="ILLEGAL_TARGET",
+                message="One or more targets are not legal.",
+                rejected_action=pdu))
+            return
+
+        if not payment_covers_cost(mana_payment, spell) or not caster.pay_mana(mana_payment):
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(), code="INSUFFICIENT_MANA",
+                message="mana_payment does not satisfy this spell's cost.",
+                rejected_action=pdu))
+            return
+
+        with self.lock:
+            caster.hand.remove(card_id)
+            item = StackItem(
+                stack_item_id=self._next_stack_item_id(),
+                item_type=StackItemType.SPELL,
+                source_id=card_id,
+                controller_id=player_id,
+                targets=targets,
+            )
+            self.game_state.push_stack_item(item)
+            # RFC 8.1 rule 3: "that player retains priority" -- the pass
+            # streak resets since a new event just occurred.
+            self._priority_passes = 0
+            self.game_state.priority_holder_id = player_id
+            recipients = [self.clients[self.player_id_to_label[pid]]
+                          for pid in self.game_state.players]
+
+        for c in recipients:
+            c.send_pdu(pdu_builders.build_stack_push(seq_num=c.next_seq(), stack_item=item))
+
+        conn.send_pdu(pdu_builders.build_priority_grant(
+            seq_num=conn.next_seq(), player_id=player_id))
 
     def _handle_activate_ability(self, label: str, conn: Connection, pdu: dict) -> None:
-        pass
+        if self.game_state.lifecycle_state != LifecycleState.IN_GAME:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(), code="WRONG_PHASE",
+                message="ACTIVATE_ABILITY is only valid during IN_GAME.",
+                rejected_action=pdu))
+            return
+
+        player_id = getattr(conn, "player_id", None)
+        controller = self.game_state.players.get(player_id)
+        if controller is None:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(), code="ILLEGAL_ACTION",
+                message="No registered player for this connection.",
+                rejected_action=pdu))
+            return
+
+        if player_id != self.game_state.priority_holder_id:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(), code="NOT_YOUR_PRIORITY",
+                message="You do not currently hold priority.",
+                rejected_action=pdu))
+            return
+
+        if conn.is_stale(pdu):
+            error, grant = conn.build_stale_action_response(pdu, player_id=player_id)
+            conn.send_pdu(error)
+            conn.send_pdu(grant)
+            return
+
+        source_id = pdu.get("source_id")
+        # ability_index is part of the RFC 10.2.8 schema but cannot yet be
+        # validated against anything: no card in this project carries a
+        # structured per-ability list (only free-text "Simplified Effect"
+        # strings, docs/mtgnp_master_card_list.xlsx) -- that data model is
+        # Milestone #19's job. Every activation is accepted structurally
+        # regardless of index.
+        targets = pdu.get("targets") or []
+        cost_payment = pdu.get("cost_payment") or {}
+        tap_cost = bool(cost_payment.get("tap"))
+        mana_cost = cost_payment.get("mana") or {}
+
+        source = next((c for c in controller.board if c.card_id == source_id), None)
+        if source is None:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(), code="ILLEGAL_ACTION",
+                message=f"'{source_id}' is not a permanent you control.",
+                rejected_action=pdu))
+            return
+
+        # RFC 10.2.8 comment: "Server rejects with ILLEGAL_ACTION if
+        # permanent is already tapped".
+        if tap_cost and getattr(source, "is_tapped", False):
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(), code="ILLEGAL_ACTION",
+                message=f"'{source_id}' is already tapped.",
+                rejected_action=pdu))
+            return
+
+        if not self._targets_still_legal(targets):
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(), code="ILLEGAL_TARGET",
+                message="One or more targets are not legal.",
+                rejected_action=pdu))
+            return
+
+        if mana_cost and not controller.pay_mana(mana_cost):
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(), code="INSUFFICIENT_MANA",
+                message="cost_payment.mana does not satisfy this ability's cost.",
+                rejected_action=pdu))
+            return
+
+        with self.lock:
+            if tap_cost:
+                source.is_tapped = True
+            item = StackItem(
+                stack_item_id=self._next_stack_item_id(),
+                item_type=StackItemType.ABILITY,
+                source_id=source_id,
+                controller_id=player_id,
+                targets=targets,
+            )
+            self.game_state.push_stack_item(item)
+            self._priority_passes = 0
+            self.game_state.priority_holder_id = player_id
+            recipients = [self.clients[self.player_id_to_label[pid]]
+                          for pid in self.game_state.players]
+
+        for c in recipients:
+            c.send_pdu(pdu_builders.build_stack_push(seq_num=c.next_seq(), stack_item=item))
+
+        conn.send_pdu(pdu_builders.build_priority_grant(
+            seq_num=conn.next_seq(), player_id=player_id))
 
     def _handle_trigger_order_response(self, label: str, conn: Connection, pdu: dict) -> None:
         pass
