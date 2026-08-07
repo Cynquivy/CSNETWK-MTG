@@ -8,7 +8,11 @@ class player:
         self.player_id = player_id
         self.life = 20
         self.is_active_player = False
-        self.keep_cards = True
+        # RFC 6.4: whether this player has sent MULLIGAN_CHOICE with
+        # keep=true for their current hand. False until they actually do
+        # -- defaulting this to True would let a player who has made no
+        # decision at all count as "kept" (see GameServer._maybe_begin_in_game).
+        self.keep_cards = False
         self.mulligan_count = 0
         self.hand = []
         self.board = []

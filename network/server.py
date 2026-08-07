@@ -1,4 +1,5 @@
 import argparse
+import random
 import socket
 import threading
 
@@ -252,7 +253,8 @@ class GameServer:
             f"({players_ready}/{MAX_PLAYERS} players ready)")
 
         if both_ready:
-            log("[server] both players ready -- transitioning to GAME_SETUP (Milestone #7)")
+            log("[server] both players ready -- running GAME_SETUP (RFC 6.3)")
+            self._run_game_setup()
             return
 
         conn.send_pdu(pdu_builders.build_game_state_update_lobby(
@@ -261,8 +263,203 @@ class GameServer:
             waiting_for=waiting_for,
         ))
 
+    def _run_game_setup(self) -> None:
+        """
+        RFC 6.3 GAME_SETUP: "The server performs the following operations
+        automatically, without requiring player input" -- so this runs
+        immediately once both players are ready (called from the tail of
+        _handle_player_ready), not in response to any further PDU. Deck
+        legality (step 1) was already validated at PLAYER_READY time
+        (Milestone #6); this covers steps 2-6.
+        """
+        with self.lock:
+            for player_id, deck_list in self.pending_decks.items():
+                # RFC's PLAYER_READY carries no separate display-name
+                # field, so player_id doubles as both.
+                p = player(player_id, player_id)
+                p.initialize_library(deck_list)   # step 2 (life=20 default) + step 3 (shuffle)
+                p.draw_from_lib(7)                 # step 4
+                self.game_state.add_player(p)
+
+            self.game_state.turn = 0  # RFC 6.5: turn becomes 1 only once IN_GAME begins
+            # step 5: coin flip
+            self.game_state.active_player_id = random.choice(list(self.game_state.players.keys()))
+            self.game_state.lifecycle_state = LifecycleState.MULLIGAN
+            self.pending_decks.clear()
+
+            recipients = [(pid, self.clients[self.player_id_to_label[pid]])
+                          for pid in self.game_state.players]
+
+        # step 6: personalized GAME_STATE_UPDATE per player, sent after
+        # releasing the lock (network I/O should not hold it).
+        for player_id, conn in recipients:
+            conn.send_pdu(pdu_builders.build_game_state_update_in_game(
+                seq_num=conn.next_seq(),
+                game_state=self.game_state,
+                viewer_player_id=player_id,
+            ))
+
+        log(f"[server] GAME_SETUP complete -- lifecycle_state=MULLIGAN, "
+            f"active_player={self.game_state.active_player_id}")
+
     def _handle_mulligan_choice(self, label: str, conn: Connection, pdu: dict) -> None:
-        pass
+        # RFC 6.1/6.4: MULLIGAN_CHOICE is only meaningful in the MULLIGAN
+        # lifecycle state.
+        if self.game_state.lifecycle_state != LifecycleState.MULLIGAN:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="WRONG_PHASE",
+                message="MULLIGAN_CHOICE is only valid in the MULLIGAN state.",
+                rejected_action=pdu,
+            ))
+            return
+
+        player_id = getattr(conn, "player_id", None)
+        p = self.game_state.players.get(player_id)
+        if p is None:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="ILLEGAL_ACTION",
+                message="No registered player for this connection.",
+                rejected_action=pdu,
+            ))
+            return
+
+        # Not an RFC-literal case (the RFC assumes each player decides
+        # exactly once per hand), but without this guard a duplicate
+        # MULLIGAN_CHOICE resending the same already-consumed seq_num
+        # would pass the echo check below and try to remove already-
+        # bottomed cards a second time.
+        if p.keep_cards:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="ILLEGAL_ACTION",
+                message="You have already kept your hand.",
+                rejected_action=pdu,
+            ))
+            return
+
+        # RFC 5.4: MULLIGAN_CHOICE echoes the seq_num of the GAME_STATE_UPDATE
+        # sent at MULLIGAN's start or after this player's last redraw --
+        # exactly what Connection tracks automatically (Milestone #5).
+        if conn.is_stale(pdu):
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="STALE_ACTION",
+                message=(f"seq_num mismatch. Expected "
+                         f"{conn.expected_seq_for('MULLIGAN_CHOICE')}, got {pdu.get('seq_num')}."),
+                rejected_action=pdu,
+            ))
+            # RFC 11 step 3 ("if the player still holds priority, re-issue
+            # PRIORITY_GRANT") does not apply here -- mulligan decisions
+            # never involve priority, so there is nothing to re-issue.
+            return
+
+        keep = pdu.get("keep")
+        if not isinstance(keep, bool):
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="ILLEGAL_ACTION",
+                message="'keep' must be a boolean.",
+                rejected_action=pdu,
+            ))
+            return
+
+        cards_to_bottom = pdu.get("cards_to_bottom")
+
+        if not keep:
+            # RFC 6.4 / Examples.pdf footnote: cards_to_bottom MUST be
+            # empty when keep is false.
+            if cards_to_bottom:
+                conn.send_pdu(pdu_builders.build_error(
+                    seq_num=conn.next_seq(),
+                    code="ILLEGAL_ACTION",
+                    message="cards_to_bottom must be empty when keep is false.",
+                    rejected_action=pdu,
+                ))
+                return
+
+            # London Mulligan redraw (RFC 6.4): shuffle the hand back in,
+            # draw a fresh 7. The bottoming happens only once they keep.
+            p.mulligan_count += 1
+            p.library.extend(p.hand)
+            p.hand.clear()
+            random.shuffle(p.library)
+            p.draw_from_lib(7)
+
+            conn.send_pdu(pdu_builders.build_game_state_update_in_game(
+                seq_num=conn.next_seq(),
+                game_state=self.game_state,
+                viewer_player_id=player_id,
+            ))
+            return
+
+        # keep == True: RFC 6.4 -- cards_to_bottom MUST contain exactly N
+        # distinct card ids from the player's current hand, where N is
+        # how many times they have mulliganed.
+        valid_bottom = (
+            isinstance(cards_to_bottom, list)
+            and len(cards_to_bottom) == p.mulligan_count
+            and len(set(cards_to_bottom)) == len(cards_to_bottom)
+            and all(c in p.hand for c in cards_to_bottom)
+        )
+        if not valid_bottom:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="ILLEGAL_ACTION",
+                message=(f"cards_to_bottom must contain exactly {p.mulligan_count} "
+                         f"distinct card id(s) from your hand."),
+                rejected_action=pdu,
+            ))
+            return
+
+        for card_id in cards_to_bottom:
+            p.hand.remove(card_id)
+            p.library.insert(0, card_id)
+        p.keep_cards = True
+
+        log(f"[server] {player_id} kept their hand "
+            f"(mulligan_count={p.mulligan_count})")
+
+        self._maybe_begin_in_game()
+
+    def _maybe_begin_in_game(self) -> None:
+        """
+        RFC 6.4: "When both players have sent MULLIGAN_CHOICE with keep:
+        true, the server transitions to IN_GAME and begins the first
+        player's turn." RFC 6.5: the turn counter is set to 1 here. Stops
+        at the single PHASE_TRANSITION(MULLIGAN -> UNTAP) broadcast that
+        bridges the two states (matching Examples.pdf's own Step 11) --
+        actually executing the Untap Step's body (untap permanents, open
+        Upkeep's priority window, ...) is Milestone #8's turn engine.
+        """
+        with self.lock:
+            if self.game_state.lifecycle_state != LifecycleState.MULLIGAN:
+                return
+            if len(self.game_state.players) < MAX_PLAYERS:
+                return
+            if not all(pl.keep_cards for pl in self.game_state.players.values()):
+                return
+
+            self.game_state.lifecycle_state = LifecycleState.IN_GAME
+            self.game_state.turn = 1
+            self.game_state.phase = Phase.UNTAP
+            active_player_id = self.game_state.active_player_id
+            recipients = [self.clients[self.player_id_to_label[pid]]
+                          for pid in self.game_state.players]
+
+        for conn in recipients:
+            conn.send_pdu(pdu_builders.build_phase_transition(
+                seq_num=conn.next_seq(),
+                from_phase="MULLIGAN",
+                to_phase=Phase.UNTAP,
+                active_player_id=active_player_id,
+                turn=1,
+            ))
+
+        log(f"[server] both players kept -- IN_GAME turn 1, "
+            f"active_player={active_player_id} "
+            f"(Milestone #8 takes over turn/phase execution from here)")
 
     def _handle_priority_pass(self, label: str, conn: Connection, pdu: dict) -> None:
         pass
