@@ -18,7 +18,7 @@ class player:
         self.attackers = []
         self.defenders = []
         self.has_priority = False
-        self.has_played_land = False
+        self.land_played_this_turn = False  # RFC 10.2.2 field name; reset every Untap Step (RFC 7.2)
     
     def validate_deck(self, deck_list: list):
         cards_seen = set()

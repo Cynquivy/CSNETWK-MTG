@@ -366,7 +366,7 @@ class GameController:
                     card.toughness = card.base_toughness
                     card.damage_marked = 0
         
-        active_player.has_played_land = False
+        active_player.land_played_this_turn = False
         
         self.state.AP_idx, self.state.NAP_idx = (self.state.NAP_idx, self.state.AP_idx)
     
@@ -394,14 +394,14 @@ class GameController:
                     and self.state.phase in (Phase.MAIN_ONE, Phase.MAIN_TWO)
                     and land is not None
                     and land in player.hand
-                    and not player.has_played_land
+                    and not player.land_played_this_turn
                 )
-            
+
                 if can_play_land:
                     player.hand.remove(land)
                     player.board.append(land)
                     land.is_tapped = False
-                    player.has_played_land = True
+                    player.land_played_this_turn = True
                     pass_ctr = 0
                 else:
                     print("Cannot play land.")
