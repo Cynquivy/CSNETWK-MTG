@@ -24,16 +24,13 @@ client_state = {
 }
 
 def _handle_game_state_update(conn: Connection, pdu: dict) -> None:
-    state = pdu.get("state")
+    state = pdu.get("state", {})
+    client_state["last_game_state"] = pdu
+    client_state["last_game_state_update_seq"] = pdu.get("seq_num")
     phase = state.get("phase")
 
     if phase == "LOBBY":
-        ready = state.get("players_ready", 0)
-        waiting_for = state.get("waiting_for", [])
-
-        log(f"[client] LOBBY: {ready}/2 players ready")
-        for name in waiting_for:
-            log(f"[client]   waiting on: {name}")
+        render_lobby_cli(state)
 
     elif phase == "MULLIGAN":
         render_mulligan_cli(state, client_state["player_id"])
@@ -62,6 +59,24 @@ def _handle_game_state_update(conn: Connection, pdu: dict) -> None:
 
     else:
         log(f"[client] GAME_STATE_UPDATE with unhandled phase '{phase}': {state}")
+
+
+def render_lobby_cli(state: dict) -> None:
+    ready = state.get("players_ready")
+    waiting_for = state.get("waiting_for", [])
+
+    log("=" * 60)
+    log(" LOBBY")
+    log("=" * 60)
+    log(f" Players ready: {ready}/2")
+    if waiting_for:
+        log(f" Waiting on: {', '.join(waiting_for)}")
+    else:
+        log(" All players ready -- starting game...")
+    log("-" * 60)
+    log(" Commands:")
+    log("   ready <player_id>   -- send PLAYER_READY with a sample deck")
+    log("=" * 60)
 
 
 def render_mulligan_cli(state: dict, my_id: str) -> None:
@@ -238,13 +253,11 @@ def run_self_test(conn: Connection) -> None:
 
 
 def interactive_loop(conn: Connection) -> None:
-    log("[client] commands: 'ready <id>', 'ping', 'mulligan', 'help', 'q'")
+    log("[client] press Enter to send a PING, or type 'q' then Enter to quit")
     ping_seq = 1
-
     while True:
-        print("[client] > ", end="", flush=True)
         try:
-            command = input("[client] > ")
+            command = input()
         except EOFError: # e.g. stdin closed
             break
 
