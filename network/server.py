@@ -3,6 +3,7 @@ import random
 import socket
 import threading
 
+from model import land
 from network import protocol
 from network.protocol import Connection, ConnectionClosed, ProtocolError, log
 from network import pdu as pdu_builders
@@ -1392,7 +1393,7 @@ class GameServer:
             return
 
         # Example Step 15: PLAY_LAND does not use the stack; one per turn limit; Main phase only.
-        if self.game_state.phase not in ("PRECOMBAT_MAIN", "POSTCOMBAT_MAIN"):
+        if self.game_state.phase not in (Phase.PRECOMBAT_MAIN, Phase.POSTCOMBAT_MAIN):
             conn.send_pdu(pdu_builders.build_error(
                 seq_num=conn.next_seq(),
                 code="ILLEGAL_ACTION",
@@ -1426,8 +1427,8 @@ class GameServer:
             return
 
         # RFC 7.5: A player may play one land per turn. 
-        # This is tracked by the Player.land_played attribute.
-        if p.land_played:
+        # This is tracked by the Player.land_played_this_turn attribute.
+        if p.land_played_this_turn:
             conn.send_pdu(pdu_builders.build_error(
                 seq_num=conn.next_seq(),
                 code="ILLEGAL_ACTION",
@@ -1437,6 +1438,7 @@ class GameServer:
             return
 
         card_id = pdu.get("card_id")
+
         if card_id not in p.hand:
             conn.send_pdu(pdu_builders.build_error(
                 seq_num=conn.next_seq(),
@@ -1446,8 +1448,8 @@ class GameServer:
             ))
             return
 
-        card_def = card_database.CARD_DATABASE.get(card_id)
-        if card_def is None or card_def.get("type") != "Land":
+        card_obj = card_database.CARD_DATABASE.get(card_id)
+        if card_obj is None or card_obj.card_type != "Land":
             conn.send_pdu(pdu_builders.build_error(
                 seq_num=conn.next_seq(),
                 code="ILLEGAL_ACTION",
@@ -1457,9 +1459,9 @@ class GameServer:
             return
 
         with self.lock:
-            p.hand.remove(card_id)
-            p.board.append(card_id)
-            p.land_played = True
+            p.hand.remove(card_id)        # hand holds strings -- remove the string
+            p.board.append(card_obj)      # board holds objects -- append the object
+            p.land_played_this_turn = True
 
         log(f"[server] {player_id} played land {card_id}")
 
