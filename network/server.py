@@ -1486,7 +1486,54 @@ class GameServer:
         pass
 
     def _handle_concede(self, label: str, conn: Connection, pdu: dict) -> None:
-        pass
+        # RFC 5.4: CONCEDE may be sent at any time regardless of which player holds 
+        # priority; its seq_num MUST be the value from the most recently received 
+        # server PDU of any type (not necessarily a PRIORITY_GRANT)
+        if conn.is_stale(pdu):
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="STALE_ACTION",
+                message=(f"seq_num mismatch. Expected "
+                        f"{conn.expected_seq_for('CONCEDE')}, got {pdu.get('seq_num')}."),
+                rejected_action=pdu,
+            ))
+            return
+
+        player_id = getattr(conn, "player_id", None)
+        p = self.game_state.players.get(player_id)
+        if p is None:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="ILLEGAL_ACTION",
+                message="No registered player for this connection.",
+                rejected_action=pdu,
+            ))
+            return
+
+        # determine the winner: the other registered player.
+        winner_id = next((pid for pid in self.game_state.players if pid != player_id), None)
+
+        log(f"[server] {player_id} conceded -- winner={winner_id}")
+
+        with self.lock:
+            recipients = [self.clients[self.player_id_to_label[pid]]
+                        for pid in self.game_state.players]
+
+        for recv_conn in recipients:
+            recv_conn.send_pdu(pdu_builders.build_game_over(
+                seq_num=recv_conn.next_seq(),
+                winner_id=winner_id,
+                loser_id=player_id,
+                reason="CONCEDE",
+            ))
+
+        with self.lock:
+            self.game_state = GameState()          # creates a fresh state for the next match
+            self.player_id_to_label.clear()
+            self.pending_decks.clear()
+            self.game_state.lifecycle_state = LifecycleState.LOBBY
+
+        log("[server] returned to LOBBY state after CONCEDE")
 
     def _handle_ping(self, label: str, conn: Connection, pdu: dict) -> None:
         conn.send_pdu({
