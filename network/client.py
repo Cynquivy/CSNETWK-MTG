@@ -41,7 +41,7 @@ def _handle_game_state_update(conn: Connection, pdu: dict) -> None:
         client_state["last_game_state_update_seq"] = pdu.get("seq_num")
 
     elif phase == "UNTAP":
-        render_in_game_cli(state, client_state.get("player_id"))
+        render_in_game_cli(state, client_state["player_id"])
 
     else:
         log(f"[client] GAME_STATE_UPDATE with unhandled phase '{phase}': {state}")
@@ -114,6 +114,7 @@ def _handle_phase_transition(conn: Connection, pdu: dict) -> None:
     active_player = pdu.get("active_player")
     my_id = client_state["player_id"]
 
+    render_in_game_cli(client_state.get("last_game_state", {}).get("state", {}), my_id)
     if to_phase == "DECLARE_ATTACKERS" and active_player == my_id:
         prompt_declare_attackers(conn)
     elif to_phase == "DECLARE_BLOCKERS" and active_player != my_id:
