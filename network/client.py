@@ -107,18 +107,24 @@ def handle_mulligan_command(conn: Connection, parts: list) -> None:
 def _handle_phase_transition(conn: Connection, pdu: dict) -> None:
     log(f"[client] PHASE_TRANSITION: {pdu.get('from_phase')} -> {pdu.get('to_phase')} "
         f"(active_player={pdu.get('active_player')} turn={pdu.get('turn')})")
-    
+
     client_state["last_phase_transition_seq"] = pdu.get("seq_num")
 
     to_phase = pdu.get("to_phase")
     active_player = pdu.get("active_player")
     my_id = client_state["player_id"]
 
-    render_in_game_cli(client_state.get("last_game_state", {}).get("state", {}), my_id)
     if to_phase == "DECLARE_ATTACKERS" and active_player == my_id:
-        prompt_declare_attackers(conn)
+        state = client_state["last_game_state"].get("state", {})
+        battlefield = state.get("battlefield", {}).get(my_id, [])
+        log(f"[client] your battlefield: {battlefield}")
+        log("[client] type: attack <id1> <id2> ...  (or just 'attack' for none)")
+
     elif to_phase == "DECLARE_BLOCKERS" and active_player != my_id:
-        prompt_declare_blockers(conn)
+        state = client_state["last_game_state"].get("state", {})
+        battlefield = state.get("battlefield", {}).get(my_id, [])
+        log(f"[client] your battlefield: {battlefield}")
+        log("[client] type: block <attacker_id> <blocker_id>  (or just 'block' for none)")
 
 
 def _handle_priority_grant(conn: Connection, pdu: dict) -> None:
@@ -184,39 +190,12 @@ def send_play_land(conn: Connection, card_id: str) -> None:
         return
     conn.send_pdu(pdu_builders.build_play_land(seq, card_id))
 
-
-def prompt_declare_attackers(conn: Connection) -> None:
-    state = client_state["last_game_state"].get("state", {})
-    my_id = client_state["player_id"]
-    battlefield = state.get("battlefield", {}).get(my_id, [])
-
-    log(f"[client] your battlefield: {battlefield}")
-    raw = input("[client] declare attackers (space-separated creature_ids, blank for none): ").strip()
-    attacker_ids = raw.split() if raw else []
-
-    attackers = [{"creature_id": cid, "target": "opponent"} for cid in attacker_ids]
-    send_declare_attackers(conn, attackers)
-
-
 def send_declare_attackers(conn: Connection, attackers: list) -> None:
     seq = client_state["last_phase_transition_seq"]
     if seq is None:
         log("[client] no PHASE_TRANSITION recorded -- cannot declare attackers")
         return
     conn.send_pdu(pdu_builders.build_declare_attackers(seq, attackers))
-
-
-def prompt_declare_blockers(conn: Connection) -> None:
-    state = client_state["last_game_state"].get("state", {})
-    my_id = client_state["player_id"]
-    battlefield = state.get("battlefield", {}).get(my_id, [])
-
-    log(f"[client] your battlefield: {battlefield}")
-    raw = input("[client] declare blockers (space-separated creature_ids, blank for none): ").strip()
-    blocker_ids = raw.split() if raw else []
-
-    blockers = [{"blocker_id": bid} for bid in blocker_ids]
-    send_declare_blockers(conn, blockers)
 
 
 def send_declare_blockers(conn: Connection, blockers: list) -> None:
