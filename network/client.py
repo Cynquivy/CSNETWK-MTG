@@ -189,6 +189,7 @@ def send_play_land(conn: Connection, card_id: str) -> None:
         log("[client] no PRIORITY_GRANT recorded -- cannot play land")
         return
     conn.send_pdu(pdu_builders.build_play_land(seq, card_id))
+    log(f"[client] sent PLAY_LAND {card_id}")
 
 def send_declare_attackers(conn: Connection, attackers: list) -> None:
     seq = client_state["last_phase_transition_seq"]
@@ -378,7 +379,6 @@ def interactive_loop(conn: Connection) -> None:
                 log("[client] usage: playland <card_id>")
                 continue
             send_play_land(conn, parts[1])
-            log(f"[client] sent PLAY_LAND {parts[1]}")
             continue
 
         if normalized.startswith("attack"):
