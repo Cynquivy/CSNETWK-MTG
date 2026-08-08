@@ -270,6 +270,8 @@ def receive_loop(conn: Connection, stop_event: threading.Event) -> None:
             log(f"[client] socket error during receive: {exc}")
             running = False
 
+        client_state["last_any_server_seq"] = response.get("seq_num")
+
         handler = _handlers.get(response["type"])
         if handler is None:
             log(f"[client] Unknown pdu type {response['type']}!")
