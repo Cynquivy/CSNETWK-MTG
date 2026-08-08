@@ -1532,6 +1532,17 @@ class GameServer:
             self.player_id_to_label.clear()
             self.pending_decks.clear()
             self.game_state.lifecycle_state = LifecycleState.LOBBY
+            recipients = list(self.clients.values())
+
+        # RFC 6.1: After broadcasting GAME_OVER, the server MUST return to the LOBBY 
+        # state and await new PLAYER_READY PDUs on the same TCP connections, allowing 
+        # the same two players to start a new game without reconnecting.
+        for recv_conn in recipients:
+            recv_conn.send_pdu(pdu_builders.build_game_state_update_lobby(
+                seq_num=recv_conn.next_seq(),
+                players_ready=0,
+                waiting_for=list(self.clients.keys()),
+            ))
 
         log("[server] returned to LOBBY state after CONCEDE")
 
