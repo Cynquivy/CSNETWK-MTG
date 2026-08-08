@@ -48,54 +48,8 @@ def _handle_game_state_update(conn: Connection, pdu: dict) -> None:
         log(f"[client]   opponent hand counts = {state.get('hand_counts')}")
         log(f"[client]   battlefield = {state.get('battlefield')}")
 
-    elif phase == "IN_GAME":
-        log("[client] IN_GAME: game active")
-        log(f"[client] active_player={state.get('active_player')} turn={state.get('turn')} phase={state.get('phase')}")
-        hand = state.get("hand", {})
-        for pid, cards in hand.items():
-            log(f"[client]   hand ({pid}) = {cards}")
-        log(f"[client]   opponent hand counts = {state.get('hand_counts')}")
-        log(f"[client]   battlefield = {state.get('battlefield')}")
-
     else:
         log(f"[client] GAME_STATE_UPDATE with unhandled phase '{phase}': {state}")
-
-
-def render_lobby_cli(state: dict) -> None:
-    ready = state.get("players_ready")
-    waiting_for = state.get("waiting_for", [])
-
-    log("=" * 60)
-    log(" LOBBY")
-    log("=" * 60)
-    log(f" Players ready: {ready}/2")
-    if waiting_for:
-        log(f" Waiting on: {', '.join(waiting_for)}")
-    else:
-        log(" All players ready -- starting game...")
-    log("-" * 60)
-    log(" Commands:")
-    log("   ready <player_id>   -- send PLAYER_READY with a sample deck")
-    log("=" * 60)
-
-
-def render_mulligan_cli(state: dict, my_id: str) -> None:
-    """Display the current mulligan-phase state to the player."""
-    hand = state.get("hand", {}).get(my_id, [])
-    mulligan_count = client_state["mulligan_count"]
-
-    log("=" * 60)
-    log(" MULLIGAN PHASE")
-    log("=" * 60)
-    log(f" Turn {state.get('turn')}  |  Active player: {state.get('active_player')}")
-    log(f" You have mulliganed {mulligan_count} time(s)")
-    log(f" Your hand ({len(hand)}): {', '.join(hand) if hand else '(empty)'}")
-    log("-" * 60)
-    log(" Commands:")
-    log("   mulligan mull            -- take a mulligan, draw a fresh 7")
-    log("   mulligan keep auto       -- keep, auto-bottom the required cards")
-    log("   mulligan keep <card_ids> -- keep, bottom these specific cards")
-    log("=" * 60)
 
 
 def handle_mulligan_command(conn: Connection, parts: list) -> None:
@@ -153,6 +107,8 @@ def handle_mulligan_command(conn: Connection, parts: list) -> None:
     else:
         log(f"[client] unknown mulligan verb '{verb}' -- use 'mull' or 'keep'")
 
+    print("[client] > ", end="", flush=True)
+
 def _handle_phase_transition(conn: Connection, pdu: dict) -> None:
     log(f"[client] PHASE_TRANSITION: {pdu.get('from_phase')} -> {pdu.get('to_phase')} "
         f"(active_player={pdu.get('active_player')} turn={pdu.get('turn')})")
@@ -186,6 +142,7 @@ def _handle_pong(conn: Connection, pdu: dict) -> None:
     now = int(time.time() * 1000)
     rtt = now - pdu["timestamp"]
     log(f"[client] PONG received (seq_num={pdu['seq_num']}), rtt={rtt}ms")
+    print("[client] > ", end="", flush=True)
 
 
 def _build_sample_deck(limit: int = 50) -> list:
@@ -253,10 +210,11 @@ def run_self_test(conn: Connection) -> None:
 
 
 def interactive_loop(conn: Connection) -> None:
-    log("[client] press Enter to send a PING, or type 'q' then Enter to quit")
     ping_seq = 1
     while True:
         try:
+            # "[client] >" is printed inside the CLI methods because this input() is called first
+            # before the CLI methods are called, so the "[client] > " prompt is printed after the CLI output. 
             command = input()
         except EOFError: # e.g. stdin closed
             break
@@ -281,6 +239,7 @@ def interactive_loop(conn: Connection) -> None:
             parts = command.strip().split()
             if len(parts) < 2:
                 log("[client] usage: ready <player_id>")
+                print("[client] > ", end="", flush=True)
                 continue
             player_id = parts[1]
             deck_list = _build_sample_deck(50)
@@ -303,9 +262,11 @@ def interactive_loop(conn: Connection) -> None:
             log("  mulligan keep auto    keep and bottom N random cards")
             log("  mulligan keep <ids>   keep and bottom the listed card ids")
             log("  q                     quit")
+            print("[client] > ", end="", flush=True)
             continue
 
         log(f"[client] unknown command: {command}")
+        print("[client] > ", end="", flush=True)
         continue
 
 
@@ -375,7 +336,7 @@ def main() -> None:
     stop_event = threading.Event()
     receiver = threading.Thread(target=receive_loop, args=(conn, stop_event), daemon=True)
 
-    log(f"[client] connected to {args.host}:{args.port}")
+    render_welcome_cli(args.host, args.port)
     receiver.start()
     try:
         interactive_loop(conn)
@@ -390,6 +351,63 @@ def main() -> None:
         conn.close()
         receiver.join(timeout=1.0)
         log("[client] disconnected")
+
+
+def render_welcome_cli(host: str, port: int) -> None:
+    width = 60
+    log("=" * width)
+    log("MTGNP CLIENT".center(width))
+    log("=" * width)
+    log(f" Connected to server: {host}:{port}")
+    log("-" * width)
+    log(" Commands:")
+    log("   ready <player_id>   -- join with a sample deck")
+    log("   ping                -- send a heartbeat PING")
+    log("   help                -- show all commands")
+    log("   q                   -- quit")
+    log("=" * width)
+    log(" Waiting in LOBBY -- type 'ready <player_id>' to begin")
+
+
+def render_lobby_cli(state: dict) -> None:
+    width = 60
+    ready = state.get("players_ready")
+    waiting_for = state.get("waiting_for", [])
+
+    log("=" * width)
+    log("LOBBY".center(width))
+    log("=" * width)
+    log(f" Players ready: {ready}/2")
+    if waiting_for:
+        log(f" Waiting on: {', '.join(waiting_for)}")
+    else:
+        log(" All players ready -- starting game...")
+    log("-" * 60)
+    log(" Commands:")
+    log("   ready <player_id>   -- send PLAYER_READY with a sample deck")
+    log("=" * 60)
+    print("[client] > ", end="", flush=True)
+
+
+def render_mulligan_cli(state: dict, my_id: str) -> None:
+    """Display the current mulligan-phase state to the player."""
+    width = 60
+    hand = state.get("hand", {}).get(my_id, [])
+    mulligan_count = client_state["mulligan_count"]
+
+    log("=" * width)
+    log("MULLIGAN PHASE".center(width))
+    log("=" * width)
+    log(f" Turn {state.get('turn')}  |  Active player: {state.get('active_player')}")
+    log(f" You have mulliganed {mulligan_count} time(s)")
+    log(f" Your hand ({len(hand)}): {', '.join(hand) if hand else '(empty)'}")
+    log("-" * width)
+    log(" Commands:")
+    log("   mulligan mull            -- take a mulligan, draw a fresh 7")
+    log("   mulligan keep auto       -- keep, auto-bottom the required cards")
+    log("   mulligan keep <card_ids> -- keep, bottom these specific cards")
+    log("=" * width)
+    print("[client] > ", end="", flush=True)
 
 
 if __name__ == "__main__":
