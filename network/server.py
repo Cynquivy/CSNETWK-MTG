@@ -4,7 +4,7 @@ import socket
 import threading
 
 from network import protocol
-from network.protocol import (Connection, ConnectionClosed, ProtocolError, log)
+from network.protocol import Connection, ConnectionClosed, ProtocolError, log
 from network import pdu as pdu_builders
 
 from model.phase import Phase, TURN_SEQUENCE
