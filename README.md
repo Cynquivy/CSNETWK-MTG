@@ -232,6 +232,150 @@ print('total cards in the fixed card set:', len(card_database.CARD_DATABASE))
 Expect `library` to contain the two card IDs (shuffled) and the card set
 total to print `312`, matching `docs/mtgnp_master_card_list.xlsx`.
 
+
+### 5. Combat Test
+
+```
+python -c "
+import socket, json, struct, threading, time
+from network.server import GameServer
+from model.card_database import card_database
+
+server = GameServer('127.0.0.1', 47010, verbose=False)
+threading.Thread(target=server.start, daemon=True).start()
+time.sleep(0.3)
+
+def client():
+    s = socket.create_connection(('127.0.0.1', 47010), timeout=5)
+    def send(pdu):
+        p = json.dumps(pdu).encode()
+        s.sendall(struct.pack('>I', len(p)) + p)
+    def recv():
+        (n,) = struct.unpack('>I', s.recv(4))
+        return json.loads(s.recv(n).decode())
+    return send, recv
+
+send1, recv1 = client()
+send2, recv2 = client()
+deck = ['mountain_001', 'mountain_002', 'mountain_003', 'mountain_004']
+
+send1({'type': 'PLAYER_READY', 'seq_num': 1, 'player_id': 'player_1', 'deck_list': deck})
+recv1()
+send2({'type': 'PLAYER_READY', 'seq_num': 1, 'player_id': 'player_2', 'deck_list': deck})
+setup1, setup2 = recv1(), recv2()
+
+send1({'type': 'MULLIGAN_CHOICE', 'seq_num': setup1['seq_num'], 'keep': True, 'cards_to_bottom': []})
+send2({'type': 'MULLIGAN_CHOICE', 'seq_num': setup2['seq_num'], 'keep': True, 'cards_to_bottom': []})
+
+active_id = None
+for r in (recv1, recv2):
+    t = r()
+    active_id = t['active_player']
+recv1(); recv2()   # Untap Step's GAME_STATE_UPDATE
+recv1(); recv2()   # UNTAP -> UPKEEP
+
+send_ap, recv_ap = (send1, recv1) if active_id == 'player_1' else (send2, recv2)
+send_nap, recv_nap = (send2, recv2) if active_id == 'player_1' else (send1, recv1)
+opponent = server.game_state.opponent_of(active_id)
+other_id = opponent.player_id
+active = server.game_state.players[active_id]
+
+g = recv_ap(); send_ap({'type': 'PRIORITY_PASS', 'seq_num': g['seq_num']})
+g2 = recv_nap(); send_nap({'type': 'PRIORITY_PASS', 'seq_num': g2['seq_num']})
+recv_ap(); recv_nap()
+g3 = recv_ap(); send_ap({'type': 'PRIORITY_PASS', 'seq_num': g3['seq_num']})
+g4 = recv_nap(); send_nap({'type': 'PRIORITY_PASS', 'seq_num': g4['seq_num']})
+recv_ap(); recv_nap()
+main_grant = recv_ap()
+
+# Attacker: troll_ascetic (power 3, toughness 2)
+attacker_creature = card_database.CARD_DATABASE['troll_ascetic_001']
+attacker_creature.is_tapped = False
+attacker_creature.summoning_sick = False
+attacker_creature.damage_marked = 0
+active.board.append(attacker_creature)
+
+# Blocker A: llanowar_elves (power 1, toughness 1) -- fragile
+blockerA = card_database.CARD_DATABASE['llanowar_elves_001']
+blockerA.is_tapped = False
+blockerA.damage_marked = 0
+opponent.board.append(blockerA)
+
+# Blocker B: leatherback_baloth (power 4, toughness 5) -- beefy
+blockerB = card_database.CARD_DATABASE['leatherback_baloth_001']
+blockerB.is_tapped = False
+blockerB.damage_marked = 0
+opponent.board.append(blockerB)
+
+send_ap({'type': 'PRIORITY_PASS', 'seq_num': main_grant['seq_num']})
+g6 = recv_nap(); send_nap({'type': 'PRIORITY_PASS', 'seq_num': g6['seq_num']})
+t_begin_ap = recv_ap(); t_begin_nap = recv_nap()
+
+g7 = recv_ap(); send_ap({'type': 'PRIORITY_PASS', 'seq_num': g7['seq_num']})
+g8 = recv_nap(); send_nap({'type': 'PRIORITY_PASS', 'seq_num': g8['seq_num']})
+t_declare_ap = recv_ap(); t_declare_nap = recv_nap()
+
+send_ap({'type': 'DECLARE_ATTACKERS', 'seq_num': t_declare_ap['seq_num'],
+         'attackers': [{'creature_id': 'troll_ascetic_001', 'target': other_id}]})
+recv_ap(); recv_nap()
+declare_attackers_prio = recv_ap()
+
+send_ap({'type': 'PRIORITY_PASS', 'seq_num': declare_attackers_prio['seq_num']})
+g9 = recv_nap(); send_nap({'type': 'PRIORITY_PASS', 'seq_num': g9['seq_num']})
+t_blockers_ap = recv_ap(); t_blockers_nap = recv_nap()
+
+# NAP declares BOTH blockers on the same attacker -- leatherback listed FIRST,
+# llanowar SECOND, so the natural blocked_by append order is [leatherback, llanowar].
+send_nap({'type': 'DECLARE_BLOCKERS', 'seq_num': t_blockers_nap['seq_num'],
+          'blockers': [
+              {'creature_id': 'leatherback_baloth_001', 'blocking_id': 'troll_ascetic_001'},
+              {'creature_id': 'llanowar_elves_001', 'blocking_id': 'troll_ascetic_001'},
+          ]})
+recv_ap(); recv_nap()
+assert len(attacker_creature.blocked_by) == 2
+assert attacker_creature.blocked_by[0] is blockerB and attacker_creature.blocked_by[1] is blockerA
+declare_blockers_prio = recv_ap()
+
+# Two blockers -> ASSIGN_DAMAGE_ORDER must NOT be skipped.
+send_ap({'type': 'PRIORITY_PASS', 'seq_num': declare_blockers_prio['seq_num']})
+g10 = recv_nap(); send_nap({'type': 'PRIORITY_PASS', 'seq_num': g10['seq_num']})
+t_order_ap = recv_ap(); t_order_nap = recv_nap()
+assert t_order_ap['to_phase'] == 'ASSIGN_DAMAGE_ORDER', t_order_ap
+
+# Submit the REVERSE of the natural declare order: llanowar first, leatherback second.
+send_ap({'type': 'ASSIGN_DAMAGE_ORDER', 'seq_num': t_order_ap['seq_num'],
+         'attacker_id': 'troll_ascetic_001',
+         'blocker_order': ['llanowar_elves_001', 'leatherback_baloth_001']})
+ad_grant = recv_ap()
+assert attacker_creature.damage_order == [blockerA, blockerB], \
+    'ASSIGN_DAMAGE_ORDER did not override the natural blocked_by order!'
+
+send_ap({'type': 'PRIORITY_PASS', 'seq_num': ad_grant['seq_num']})
+g11 = recv_nap(); send_nap({'type': 'PRIORITY_PASS', 'seq_num': g11['seq_num']})
+t_dmg_ap = recv_ap(); t_dmg_nap = recv_nap()
+assert t_dmg_ap['to_phase'] == 'COMBAT_DAMAGE'
+
+result_ap = recv_ap(); result_nap = recv_nap()
+died = set(result_ap['creatures_died'])
+
+# With order [llanowar(1), leatherback(5)] and attacker power 3:
+#   llanowar takes 1 (lethal, dies), remaining 2 spills to leatherback (survives, dmg=2).
+# Had the natural order [leatherback, llanowar] been used instead, leatherback would
+# have absorbed all 3 (survives) and llanowar would take 0 (survives) -- a DIFFERENT
+# outcome. So this assertion proves ASSIGN_DAMAGE_ORDER's value was actually honored.
+assert died == {'llanowar_elves_001', 'troll_ascetic_001'}, died
+assert blockerB.damage_marked == 2 and blockerB in opponent.board
+
+recv_ap(); recv_nap()   # post-damage GAME_STATE_UPDATE
+t_eoc_ap = recv_ap(); t_eoc_nap = recv_nap()
+assert t_eoc_ap['to_phase'] == 'END_OF_COMBAT'
+eoc_prio = recv_ap()
+assert eoc_prio['type'] == 'PRIORITY_GRANT'
+
+print('ASSIGN_DAMAGE_ORDER: reversed order honored, correct creature died: PASSED')
+"
+```
+
 ## What's left
 
 Roughly in the order it makes sense to build it:

@@ -101,6 +101,8 @@ class GameServer:
         # Player as usual" (RFC 8.1 rule 1/5).
         self._trigger_priority_recipient = None
 
+        self._damage_order_pending = set()
+
         # handler table to call the corresponding method of each pdu type
         self._handlers = {
             "PLAYER_READY" : self._handle_player_ready,
@@ -527,9 +529,10 @@ class GameServer:
     def _advance_phase(self) -> None:
         with self.lock:
             current_phase = self.game_state.phase
-            current_index = TURN_SEQUENCE.index(current_phase)
-            at_end_of_turn = current_index == len(TURN_SEQUENCE) - 1
-            next_phase = TURN_SEQUENCE[0] if at_end_of_turn else TURN_SEQUENCE[current_index + 1]
+            if current_phase is Phase.END_OF_COMBAT:
+                self._clear_combat_state()
+
+            next_phase = self._next_phase_after(current_phase)
 
             self.game_state.phase = next_phase
             self.game_state.priority_holder_id = None  # RFC 10.2.2: null outside a priority window
@@ -551,6 +554,42 @@ class GameServer:
 
         self._run_phase_entry(next_phase)
 
+    # I needed to add this because combat has two conditional skip logic
+    def _next_phase_after(self, current_phase) -> Phase:
+        """
+        CONDITIONS FOR SPECIAL LOCIC:
+          - Declare Blockers -> Assign Damage Order is skipped if nothing
+            is multiply-blocked.
+          - Whatever comes after Assign Damage Order (or after Declare
+            Blockers, if that step was itself skipped) goes to First Strike
+            Damage only if a first/double-strike creature is actually
+            participating this combat; otherwise straight to Combat Damage.
+          - After first strike damage
+        """
+        if current_phase is Phase.DECLARE_BLOCKERS and not self._combat_needs_damage_order():
+            return Phase.FIRST_STRIKE_DAMAGE if self._combat_has_first_strike() else Phase.COMBAT_DAMAGE
+        if current_phase is Phase.ASSIGN_DAMAGE_ORDER:
+            return Phase.FIRST_STRIKE_DAMAGE if self._combat_has_first_strike() else Phase.COMBAT_DAMAGE
+        if current_phase is Phase.FIRST_STRIKE_DAMAGE:
+            return Phase.COMBAT_DAMAGE
+
+        index = TURN_SEQUENCE.index(current_phase)
+        at_end = index == len(TURN_SEQUENCE) - 1
+        return TURN_SEQUENCE[0] if at_end else TURN_SEQUENCE[index + 1]
+
+    # combat phase cleanup, when combat ends
+    def _clear_combat_state(self) -> None:
+        for p in self.game_state.players.values():
+            for c in p.board:
+                if isinstance(c, creature):
+                    c.will_attack = False
+                    c.will_block = False
+                    c.attack_target = None
+                    c.blocked_by = []
+                    c.damage_order = []
+                    c.was_blocked = False
+                    c.damage_marked = 0
+
     def _run_phase_entry(self, phase) -> None:
         if phase is Phase.UNTAP:
             self._run_untap_step()
@@ -559,10 +598,16 @@ class GameServer:
         elif phase is Phase.CLEANUP:
             self._run_cleanup_step()
         elif phase in (Phase.UPKEEP, Phase.PRECOMBAT_MAIN, Phase.BEGIN_COMBAT,
-                       Phase.POSTCOMBAT_MAIN, Phase.END_STEP):
+                       Phase.END_OF_COMBAT, Phase.POSTCOMBAT_MAIN, Phase.END_STEP):
             # RFC 7.3 / 7.5 / 9.2 / 7.7: no automatic action -- just open a
             # priority window with the Active Player first (RFC 8.1 rule 1).
             self._open_priority_window()
+        elif phase is Phase.ASSIGN_DAMAGE_ORDER:
+            self._begin_damage_order_step()
+        elif phase is Phase.FIRST_STRIKE_DAMAGE:
+            self._run_first_strike_damage_step()
+        elif phase is Phase.COMBAT_DAMAGE:
+            self._run_combat_damage_step()
         # else: DECLARE_ATTACKERS and later (Milestone #12). Nothing to do
         # here; the PHASE_TRANSITION already broadcast above is the only
         # signal RFC 9.3 defines for that step.
@@ -1347,14 +1392,452 @@ class GameServer:
         for c in recipients:
             c.send_pdu(pdu_builders.build_stack_push(seq_num=c.next_seq(), stack_item=item))
 
+    # HELPERS FOR COMBAT:
+
+    # Finds the actual creature object
+    def _find_creature(self, player_obj, card_id) -> creature | None:
+        for c in player_obj.board:
+            if isinstance(c, creature) and c.card_id == card_id:
+                return c
+
+        return None
+
+    # this is just to determine if we need to do damage ordering
+    # aka when an attacker is being blocked by 2+ cards
+    def _combat_needs_damage_order(self) -> bool:
+        for p in self.game_state.players.values():
+            for c in p.board:
+                if isinstance(c, creature) and c.will_attack:
+                    if len(c.blocked_by) >= 2:
+                        return True
+
+        return False
+
+    # checks if we need first/double strike logic
+    def _combat_has_first_strike(self) -> bool:
+        for p in self.game_state.players.values():
+            for c in p.board:
+                if not isinstance(c, creature):
+                    continue
+                participating = c.will_attack or c.will_block
+                if participating and (c.has_first_strike or c.has_double_strike):
+                    return True
+
+        return False
+
+    def _creatures_with_lethal_damage(self) -> list:
+        """
+        snapshot of which creatures are about to die, taken BEFORE _check_state_based_actions() removes them. 
+        Needed for COMBAT_DAMAGE_RESULT's creatures_died list (RFC 10.2.18), 
+        since the existing SBA checker only reports whether someone
+        lost the whole game, not which permanents died along the way.
+        """
+        return [
+            c.card_id
+            for p in self.game_state.players.values()
+            for c in p.board
+            if isinstance(c, creature) and (c.toughness <= 0 or c.damage_marked >= c.toughness)
+        ]
+
     def _handle_declare_attackers(self, label: str, conn: Connection, pdu: dict) -> None:
-        pass
+        # guard check
+        if self.game_state.lifecycle_state != LifecycleState.IN_GAME or self.game_state.phase is not Phase.DECLARE_ATTACKERS:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="WRONG_PHASE",
+                message="DECLARE_ATTACKERS is only valid during the Declare Attackers Step.",
+                rejected_action=pdu
+            ))
+            return
+
+        player_id = getattr(conn, "player_id", None)
+        # RFC 9.3: nobody holds priority at this exact moment -- the
+        # this checks "are you the active player", not "do you hold priority".
+        if player_id != self.game_state.active_player_id:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="NOT_YOUR_PRIORITY",
+                message="Only the Active Player declares attackers.",
+                rejected_action=pdu
+            ))
+            return
+
+        if conn.is_stale(pdu):
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="STALE_ACTION",
+                message=(f"seq_num mismatch. Expected "
+                         f"{conn.expected_seq_for('DECLARE_ATTACKERS')}, got {pdu.get('seq_num')}."),
+                rejected_action=pdu))
+            return
+
+        attackers_field = pdu.get("attackers")
+        if not isinstance(attackers_field, list):
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="ILLEGAL_ACTION",
+                message="'attackers' must be a list.",
+                rejected_action=pdu
+            ))
+            return
+
+        active = self.game_state.players[player_id]
+        opponent = self.game_state.opponent_of(player_id)
+        seen_ids = set()
+        resolved = []
+
+        for entry in attackers_field:
+            creature_id = entry.get("creature_id") if isinstance(entry, dict) else None
+            target = entry.get("target") if isinstance(entry, dict) else None
+            attacker = self._find_creature(active, creature_id)
+
+            if attacker is None:
+                conn.send_pdu(pdu_builders.build_error(
+                    seq_num=conn.next_seq(),
+                    code="ILLEGAL_ACTION",
+                    message=f"'{creature_id}' is not a creature you control.",
+                    rejected_action=pdu
+                ))
+                return
+            if creature_id in seen_ids:
+                conn.send_pdu(pdu_builders.build_error(
+                    seq_num=conn.next_seq(),
+                    code="ILLEGAL_ACTION",
+                    message=f"'{creature_id}' was declared as an attacker more than once.",
+                    rejected_action=pdu
+                ))
+                return
+            if attacker.is_tapped:
+                conn.send_pdu(pdu_builders.build_error(
+                    seq_num=conn.next_seq(),
+                    code="ILLEGAL_ACTION",
+                    message=f"'{creature_id}' is tapped and cannot attack.",
+                    rejected_action=pdu
+                ))
+                return
+            if attacker.summoning_sick and not attacker.has_haste:
+                conn.send_pdu(pdu_builders.build_error(
+                    seq_num=conn.next_seq(),
+                    code="ILLEGAL_ACTION",
+                    message=f"'{creature_id}' has summoning sickness and cannot attack.",
+                    rejected_action=pdu
+                ))
+                return
+            if opponent is None or target != opponent.player_id:
+                conn.send_pdu(pdu_builders.build_error(
+                    seq_num=conn.next_seq(),
+                    code="ILLEGAL_TARGET",
+                    message=f"'{target}' is not a legal attack target.",
+                    rejected_action=pdu
+                ))
+                return
+
+            seen_ids.add(creature_id)
+            resolved.append((attacker, target))
+
+        with self.lock:
+            for attacker, target in resolved:
+                attacker.will_attack = True
+                attacker.is_tapped = True
+                attacker.attack_target = target
+
+            recipients = [(pid, self.clients[self.player_id_to_label[pid]])
+                          for pid in self.game_state.players]
+
+        if not resolved:
+            # empty attackers == skip
+            # straight to End of Combat. No GAME_STATE_UPDATE, no priority
+            log(f"[server] {player_id} declares no attackers -- skipping to End of Combat")
+            with self.lock:
+                from_phase = self.game_state.phase
+                self.game_state.phase = Phase.END_OF_COMBAT
+                self.game_state.priority_holder_id = None
+                self._priority_passes = 0
+                active_player_id = self.game_state.active_player_id
+                turn = self.game_state.turn
+            for _, c in recipients:
+                c.send_pdu(pdu_builders.build_phase_transition(
+                    seq_num=c.next_seq(), from_phase=from_phase, to_phase=Phase.END_OF_COMBAT,
+                    active_player_id=active_player_id, turn=turn))
+            self._run_phase_entry(Phase.END_OF_COMBAT)
+            return
+
+        log(f"[server] {player_id} declares {len(resolved)} attacker(s)")
+        for pid, c in recipients:
+            c.send_pdu(pdu_builders.build_game_state_update_in_game(
+                seq_num=c.next_seq(), game_state=self.game_state, viewer_player_id=pid))
+
+        self._open_priority_window()
 
     def _handle_declare_blockers(self, label: str, conn: Connection, pdu: dict) -> None:
-        pass
+        if self.game_state.lifecycle_state != LifecycleState.IN_GAME or self.game_state.phase is not Phase.DECLARE_BLOCKERS:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="WRONG_PHASE",
+                message="DECLARE_BLOCKERS is only valid during the Declare Blockers Step.",
+                rejected_action=pdu
+            ))
+            return
+
+        player_id = getattr(conn, "player_id", None)
+        # the non-active player declares blockers.
+        if player_id is None or player_id == self.game_state.active_player_id:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="NOT_YOUR_PRIORITY",
+                message="Only the Non-Active Player declares blockers.",
+                rejected_action=pdu))
+            return
+
+        if conn.is_stale(pdu):
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(), code="STALE_ACTION",
+                message=(f"seq_num mismatch. Expected "
+                         f"{conn.expected_seq_for('DECLARE_BLOCKERS')}, got {pdu.get('seq_num')}."),
+                rejected_action=pdu
+            ))
+            return
+
+        blockers_field = pdu.get("blockers")
+        if not isinstance(blockers_field, list):
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="ILLEGAL_ACTION",
+                message="'blockers' must be a list.",
+                rejected_action=pdu
+            ))
+            return
+
+        # NON ATCIVE PLAYER
+        nap = self.game_state.players[player_id]
+        seen_blockers = set()
+        resolved = []
+
+        for entry in blockers_field:
+            creature_id = entry.get("creature_id") if isinstance(entry, dict) else None
+            blocking_id = entry.get("blocking_id") if isinstance(entry, dict) else None
+            blocker = self._find_creature(nap, creature_id)
+            attacker = self._find_creature(self.game_state.active_player, blocking_id)
+
+            if blocker is None:
+                conn.send_pdu(pdu_builders.build_error(
+                    seq_num=conn.next_seq(), code="ILLEGAL_ACTION",
+                    message=f"'{creature_id}' is not a creature you control.",
+                    rejected_action=pdu))
+                return
+            # RFC 9.4: "lists which UNTAPPED creatures block".
+            if blocker.is_tapped:
+                conn.send_pdu(pdu_builders.build_error(
+                    seq_num=conn.next_seq(), code="ILLEGAL_ACTION",
+                    message=f"'{creature_id}' is tapped and cannot block.",
+                    rejected_action=pdu))
+                return
+            # RFC 9.4: "a single creature may block only one attacker".
+            if creature_id in seen_blockers:
+                conn.send_pdu(pdu_builders.build_error(
+                    seq_num=conn.next_seq(), code="ILLEGAL_ACTION",
+                    message=f"'{creature_id}' can only block one attacker.",
+                    rejected_action=pdu))
+                return
+            if attacker is None or not attacker.will_attack:
+                conn.send_pdu(pdu_builders.build_error(
+                    seq_num=conn.next_seq(), code="ILLEGAL_ACTION",
+                    message=f"'{blocking_id}' is not an attacking creature.",
+                    rejected_action=pdu))
+                return
+
+            seen_blockers.add(creature_id)
+            resolved.append((attacker, blocker))
+
+        with self.lock:
+            for attacker, blocker in resolved:
+                # multiple creatures MAY block the same attacker
+                # appending, not overwriting, is what makes that legal.
+                attacker.blocked_by.append(blocker)
+                blocker.will_block = True
+            recipients = [(pid, self.clients[self.player_id_to_label[pid]])
+                          for pid in self.game_state.players]
+
+        log(f"[server] {player_id} declares {len(resolved)} blocker(s)")
+        for pid, c in recipients:
+            c.send_pdu(pdu_builders.build_game_state_update_in_game(
+                seq_num=c.next_seq(), game_state=self.game_state, viewer_player_id=pid))
+
+        self._open_priority_window()
+
+    def _begin_damage_order_step(self) -> None:
+        """
+        RFC 9.5: nothing automatic happens here
+        the PHASE_TRANSITION into ASSIGN_DAMAGE_ORDER
+        already broadcast by _advance_phase() is itself
+        the implicit signal for the Active Player to start sending one
+        ASSIGN_DAMAGE_ORDER PDU per multiply-blocked attacker. This just
+        records which attacker ids still need one.
+        """
+        with self.lock:
+            self._damage_order_pending = {
+                c.card_id
+                for p in self.game_state.players.values()
+                for c in p.board
+                if isinstance(c, creature) and c.will_attack and len(c.blocked_by) >= 2
+            }
 
     def _handle_assign_damage_order(self, label: str, conn: Connection, pdu: dict) -> None:
-        pass
+        if self.game_state.lifecycle_state != LifecycleState.IN_GAME or \
+           self.game_state.phase is not Phase.ASSIGN_DAMAGE_ORDER:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="WRONG_PHASE",
+                message="ASSIGN_DAMAGE_ORDER is only valid during the Assign Damage Order Step.",
+                rejected_action=pdu
+            ))
+            return
+
+        player_id = getattr(conn, "player_id", None)
+        if player_id != self.game_state.active_player_id:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(), 
+                code="NOT_YOUR_PRIORITY",
+                message="Only the Active Player assigns damage order.",
+                rejected_action=pdu
+            ))
+            return
+
+        if conn.is_stale(pdu):
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="STALE_ACTION",
+                message=(f"seq_num mismatch. Expected "
+                         f"{conn.expected_seq_for('ASSIGN_DAMAGE_ORDER')}, got {pdu.get('seq_num')}."),
+                rejected_action=pdu
+            ))
+            return
+
+        attacker_id = pdu.get("attacker_id")
+        blocker_order = pdu.get("blocker_order")
+
+        if attacker_id not in self._damage_order_pending:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="ILLEGAL_ACTION",
+                message=f"'{attacker_id}' is not awaiting a damage order.",
+                rejected_action=pdu))
+            return
+
+        attacker = self._find_creature(self.game_state.active_player, attacker_id)
+        expected_ids = {b.card_id for b in attacker.blocked_by}
+
+        if not isinstance(blocker_order, list) or len(blocker_order) != len(expected_ids) \
+           or set(blocker_order) != expected_ids:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(), code="ILLEGAL_ACTION",
+                message="blocker_order must contain exactly this attacker's blockers, once each.",
+                rejected_action=pdu))
+            return
+
+        by_id = {b.card_id: b for b in attacker.blocked_by}
+        with self.lock:
+            attacker.damage_order = [by_id[bid] for bid in blocker_order]
+            self._damage_order_pending.discard(attacker_id)
+            remaining = len(self._damage_order_pending)
+
+        log(f"[server] {player_id} ordered damage for '{attacker_id}': {blocker_order}")
+
+        if remaining == 0:
+            # After all orderings have been received, the server
+            # opens a final priority window before proceeding to the damage step.
+            self._open_priority_window()
+
+    # HELPER for computing combat dmg
+    def _compute_combat_damage(self, include_creature) -> list:
+        damage_events = []
+
+        for p in self.game_state.players.values():
+            for attacker in p.board:
+                if not isinstance(attacker, creature) or not attacker.will_attack:
+                    continue
+
+                if not attacker.blocked_by:
+                    if include_creature(attacker):
+                        defender = self.game_state.players[attacker.attack_target]
+                        defender.life -= attacker.power
+                        damage_events.append({"source": attacker.card_id,
+                                               "target": attacker.attack_target,
+                                               "amount": attacker.power})
+                    continue
+
+                # IS BLOCKED
+                if include_creature(attacker):
+                    order = attacker.damage_order or attacker.blocked_by
+                    remaining = attacker.power
+                    for blocker in order:
+                        if remaining <= 0:
+                            break
+                        lethal_left = max(0, blocker.toughness - blocker.damage_marked)
+                        amount = min(remaining, lethal_left)
+                        if amount <= 0:
+                            continue
+                        blocker.damage_marked += amount
+                        damage_events.append({"source": attacker.card_id,
+                                               "target": blocker.card_id,
+                                               "amount": amount})
+                        remaining -= amount
+
+                # blocker still hits a non-first-strike attacker in this step.
+                for blocker in attacker.blocked_by:
+                    if include_creature(blocker) and any(blocker in p.board for p in self.game_state.players.values()):
+                        attacker.damage_marked += blocker.power
+                        damage_events.append({"source": blocker.card_id,
+                                               "target": attacker.card_id,
+                                               "amount": blocker.power})
+
+        return damage_events
+
+    def _run_first_strike_damage_step(self) -> None:
+        with self.lock:
+            self._compute_combat_damage(
+                include_creature=lambda c: c.has_first_strike or c.has_double_strike)
+            recipients = [(pid, self.clients[self.player_id_to_label[pid]])
+                          for pid in self.game_state.players]
+
+        game_over = self._check_state_based_actions()
+
+        for player_id, c in recipients:
+            c.send_pdu(pdu_builders.build_game_state_update_in_game(
+                seq_num=c.next_seq(), game_state=self.game_state, viewer_player_id=player_id))
+
+        if game_over:
+            return
+
+        self._open_priority_window()
+
+    def _run_combat_damage_step(self) -> None:
+        with self.lock:
+            damage_events = self._compute_combat_damage(
+                include_creature=lambda c: not c.has_first_strike or c.has_double_strike)
+            life_totals = dict(self.game_state.life_totals)
+            recipients = [self.clients[self.player_id_to_label[pid]]
+                          for pid in self.game_state.players]
+
+        creatures_died = self._creatures_with_lethal_damage()
+        game_over = self._check_state_based_actions()
+
+        for c in recipients:
+            c.send_pdu(pdu_builders.build_combat_damage_result(
+                seq_num=c.next_seq(), damage_events=damage_events,
+                life_totals=life_totals, creatures_died=creatures_died))
+
+        with self.lock:
+            recipients2 = [(pid, self.clients[self.player_id_to_label[pid]])
+                           for pid in self.game_state.players]
+        for player_id, c in recipients2:
+            c.send_pdu(pdu_builders.build_game_state_update_in_game(
+                seq_num=c.next_seq(), game_state=self.game_state, viewer_player_id=player_id))
+
+        if game_over:
+            return
+
+        self._advance_phase()
 
     def _handle_play_land(self, label: str, conn: Connection, pdu: dict) -> None:
         pass
