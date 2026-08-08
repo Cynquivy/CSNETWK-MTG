@@ -47,6 +47,15 @@ def _handle_game_state_update(conn: Connection, pdu: dict) -> None:
         client_state["last_game_state"] = pdu
         client_state["last_game_state_update_seq"] = pdu.get("seq_num")
 
+    elif phase == "UNTAP":
+        log("[client] UNTAP: beginning of turn, untap step")
+        log(f"[client] active_player={state.get('active_player')} turn={state.get('turn')} phase={state.get('phase')}")
+        hand = state.get("hand", {})
+        for pid, cards in hand.items():
+            log(f"[client]   hand ({pid}) = {cards}")
+        log(f"[client]   opponent hand counts = {state.get('hand_counts')}")
+        log(f"[client]   battlefield = {state.get('battlefield')}")
+
     elif phase == "IN_GAME":
         log("[client] IN_GAME: game active")
         log(f"[client] active_player={state.get('active_player')} turn={state.get('turn')} phase={state.get('phase')}")
@@ -118,9 +127,6 @@ def receive_loop(conn: Connection, stop_event: threading.Event) -> None:
             log(f"[client] socket error during receive: {exc}")
             running = False
 
-        formatted_pdu = json.dumps(response, indent=2)
-
-        log(f"[client] Debug received: {formatted_pdu}")
         handler = _handlers.get(response["type"])
         if handler is None:
             log(f"[client] Unknown pdu type {response['type']}!")
@@ -302,7 +308,6 @@ def send_mulligan_choice(conn: Connection, keep: bool, cards_to_bottom: list) ->
 def receive_and_handle(conn: Connection) -> None:
     # receives a PDU from the connection, logs it, and dispatches it to the appropriate handler based on its type.
     response = conn.recv_pdu()
-    log(f"[client] Debug received: {response}")
 
     handler = _handlers.get(response["type"])
     if handler is None:
