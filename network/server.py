@@ -1528,7 +1528,7 @@ class GameServer:
             ))
 
         with self.lock:
-            self.game_state = GameState()          # creates a fresh state for the next match
+            self.game_state = ModelGameState()          # creates a fresh state for the next match
             self.player_id_to_label.clear()
             self.pending_decks.clear()
             self.game_state.lifecycle_state = LifecycleState.LOBBY
