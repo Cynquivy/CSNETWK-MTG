@@ -1357,7 +1357,128 @@ class GameServer:
         pass
 
     def _handle_play_land(self, label: str, conn: Connection, pdu: dict) -> None:
-        pass
+        # RFC 7.1: PLAY_LAND is only meaningful once the game is in progress i.e. IN_GAME phase.
+        if self.game_state.lifecycle_state != LifecycleState.IN_GAME:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="WRONG_PHASE",
+                message="PLAY_LAND is only valid during IN_GAME.",
+                rejected_action=pdu,
+            ))
+            return
+
+        # error handling for unregistered players
+        player_id = getattr(conn, "player_id", None)
+        p = self.game_state.players.get(player_id)
+        if p is None:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="ILLEGAL_ACTION",
+                message="No registered player for this connection.",
+                rejected_action=pdu,
+            ))
+            return
+
+        # PLAY_LAND is priority-bearing: seq_num must echo the most recent
+        # PRIORITY_GRANT issued to this player.
+        if conn.is_stale(pdu):
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="STALE_ACTION",
+                message=(f"seq_num mismatch. Expected "
+                        f"{conn.expected_seq_for('PLAY_LAND')}, got {pdu.get('seq_num')}."),
+                rejected_action=pdu,
+            ))
+            return
+
+        # Example Step 15: PLAY_LAND does not use the stack; one per turn limit; Main phase only.
+        if self.game_state.phase not in ("PRECOMBAT_MAIN", "POSTCOMBAT_MAIN"):
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="ILLEGAL_ACTION",
+                message="PLAY_LAND is only legal during a Main phase.",
+                rejected_action=pdu,
+            ))
+            return
+
+        # Stack must be empty to play a land. Although the RFC 7.5 does not explicitly say this
+        # for PLAY_LAND, the Main Phase actions are described as "sorcery speed for AP," which
+        # in standard MTG rules means that the stack must be empty. The statement "Playing a land 
+        # does not use the stack" from Step 15 of Examples, means the land itself isn't a stack object,
+        # but does not necessarily mean that stack state is ignored. Hence, it is assumed in this 
+        # implementation that the stack must be empty to play a land.
+        if self.game_state.stack:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="ILLEGAL_ACTION",
+                message="Cannot play a land while the stack is non-empty.",
+                rejected_action=pdu,
+            ))
+            return
+
+        if player_id != self.game_state.active_player_id:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="ILLEGAL_ACTION",
+                message="You may only play a land on your own turn.",
+                rejected_action=pdu,
+            ))
+            return
+
+        # RFC 7.5: A player may play one land per turn. 
+        # This is tracked by the Player.land_played attribute.
+        if p.land_played:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="ILLEGAL_ACTION",
+                message="You have already played a land this turn.",
+                rejected_action=pdu,
+            ))
+            return
+
+        card_id = pdu.get("card_id")
+        if card_id not in p.hand:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="ILLEGAL_ACTION",
+                message=f"'{card_id}' is not in your hand.",
+                rejected_action=pdu,
+            ))
+            return
+
+        card_def = card_database.CARD_DATABASE.get(card_id)
+        if card_def is None or card_def.get("type") != "Land":
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="ILLEGAL_ACTION",
+                message=f"'{card_id}' is not a land.",
+                rejected_action=pdu,
+            ))
+            return
+
+        with self.lock:
+            p.hand.remove(card_id)
+            p.board.append(card_id)
+            p.land_played = True
+
+        log(f"[server] {player_id} played land {card_id}")
+
+        # RFC 7.5: after playing a land, broadcast the resulting GAME_STATE_UPDATE
+        # to all players (followed by re-issuing PRIORITY_GRANT to the Active Player).
+        recipients = [(pid, self.clients[self.player_id_to_label[pid]])
+                    for pid in self.game_state.players]
+        for pid, recv_conn in recipients:
+            recv_conn.send_pdu(pdu_builders.build_game_state_update_in_game(
+                seq_num=recv_conn.next_seq(),
+                game_state=self.game_state,
+                viewer_player_id=pid,
+            ))
+
+        active_conn = self.clients[self.player_id_to_label[self.game_state.active_player_id]]
+        active_conn.send_pdu(pdu_builders.build_priority_grant(
+            seq_num=active_conn.next_seq(),
+            player_id=self.game_state.active_player_id,
+        ))
 
     def _handle_discard(self, label: str, conn: Connection, pdu: dict) -> None:
         pass
