@@ -153,7 +153,15 @@ def _handle_combat_damage_result(conn: Connection, pdu: dict) -> None:
     log(f"[client] COMBAT_DAMAGE_RESULT: {pdu}")
 
 def _handle_game_over(conn: Connection, pdu: dict) -> None:
-    log(f"[client] GAME_OVER: {pdu}")
+    # Since the game is over, a fresh match will be created and fields should'nt carry over.
+    # However, it is still worth resetting these fields to ensure that the client is in a 
+    # clean state for the next match.
+    client_state["mulligan_count"] = 0
+    client_state["has_priority"] = False
+
+    log(f"[client] GAME_OVER: winner={pdu.get('winner_id')} "
+        f"loser={pdu.get('loser_id')} reason={pdu.get('reason')}")
+    log("[client] returning to LOBBY -- type 'ready <player_id>' to start a new match")
 
 def _handle_error(conn: Connection, pdu: dict) -> None:
     log(f"[client] ERROR: {pdu.get('code')} - {pdu.get('message')}")
