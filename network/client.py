@@ -36,12 +36,7 @@ def _handle_game_state_update(conn: Connection, pdu: dict) -> None:
             log(f"[client]   waiting on: {name}")
 
     elif phase == "MULLIGAN":
-        log("[client] MULLIGAN: game setup complete, waiting for mulligan decisions")
-        log(f"[client] active_player={state.get('active_player')} turn={state.get('turn')}")
-        hand = state.get("hand", {})
-        for pid, cards in hand.items():
-            log(f"[client]   hand ({pid}) = {cards}")
-        log(f"[client]   opponent hand counts = {state.get('hand_counts')}")
+        render_mulligan_cli(state, client_state["player_id"])
 
         # remember last game state so the interactive prompt can act accordingly (e.g. for mulligan decisions)
         client_state["last_game_state"] = pdu
@@ -68,6 +63,80 @@ def _handle_game_state_update(conn: Connection, pdu: dict) -> None:
     else:
         log(f"[client] GAME_STATE_UPDATE with unhandled phase '{phase}': {state}")
 
+
+def render_mulligan_cli(state: dict, my_id: str) -> None:
+    """Display the current mulligan-phase state to the player."""
+    hand = state.get("hand", {}).get(my_id, [])
+    mulligan_count = client_state["mulligan_count"]
+
+    log("=" * 60)
+    log(" MULLIGAN PHASE")
+    log("=" * 60)
+    log(f" Turn {state.get('turn')}  |  Active player: {state.get('active_player')}")
+    log(f" You have mulliganed {mulligan_count} time(s)")
+    log(f" Your hand ({len(hand)}): {', '.join(hand) if hand else '(empty)'}")
+    log("-" * 60)
+    log(" Commands:")
+    log("   mulligan mull            -- take a mulligan, draw a fresh 7")
+    log("   mulligan keep auto       -- keep, auto-bottom the required cards")
+    log("   mulligan keep <card_ids> -- keep, bottom these specific cards")
+    log("=" * 60)
+
+
+def handle_mulligan_command(conn: Connection, parts: list) -> None:
+    """Handle the 'mulligan' command from the interactive CLI."""
+    if len(parts) < 2:
+        log("[client] usage: mulligan <mull|keep> [auto|<card_ids>]")
+        return
+
+    verb = parts[1].lower()
+
+    player_id = client_state.get("player_id")
+
+    if player_id is None:
+        log("[client] you must `ready <player_id>` first")
+        return
+
+    if client_state["last_game_state"] is None:
+        log("[client] no game state available yet")
+        return
+
+    # takes the current hand from the last game state update, which is used to determine which cards can be bottomed during a mulligan decision.
+    state = client_state["last_game_state"].get("state", {})
+    hand_map = state.get("hand", {})
+    hand = hand_map.get(player_id, [])
+
+    if verb in ("mull", "mulligan"):
+        # send keep=False
+        send_mulligan_choice(conn, keep=False, cards_to_bottom=[])
+        log(f"[client] sent MULLIGAN_CHOICE keep=False")
+        return
+
+    elif verb == "keep":
+        # Case 1: Player chose automatic selection for cards to put at the bottom
+        if len(parts) >= 3 and parts[2].lower() == "auto":
+            mulligan_count = client_state["mulligan_count"]
+            cards_to_bottom = hand[:mulligan_count]
+            send_mulligan_choice(conn, keep=True, cards_to_bottom=cards_to_bottom)
+            log(f"[client] sent MULLIGAN_CHOICE keep=True auto bottom {cards_to_bottom}")
+
+        # Case 2: Player explicitly listed specific cards to put at the bottom
+        elif len(parts) >= 3:
+            cards = parts[2:]
+            send_mulligan_choice(conn, keep=True, cards_to_bottom=cards)
+            log(f"[client] sent MULLIGAN_CHOICE keep=True bottom {cards}")
+
+        # Case 3: Player hasn't mulliganed (0 count), so no cards need to go to the bottom
+        elif client_state["mulligan_count"] == 0:
+            send_mulligan_choice(conn, keep=True, cards_to_bottom=[])
+            log("[client] sent MULLIGAN_CHOICE keep=True (no cards to bottom)")
+
+        # Case 4: Player has mulliganed but didn't specify cards to bottom
+        else:
+            log("[client] must specify cards to bottom or use 'mulligan keep auto'")
+
+    else:
+        log(f"[client] unknown mulligan verb '{verb}' -- use 'mull' or 'keep'")
 
 def _handle_phase_transition(conn: Connection, pdu: dict) -> None:
     log(f"[client] PHASE_TRANSITION: {pdu.get('from_phase')} -> {pdu.get('to_phase')} "
@@ -171,7 +240,9 @@ def run_self_test(conn: Connection) -> None:
 def interactive_loop(conn: Connection) -> None:
     log("[client] commands: 'ready <id>', 'ping', 'mulligan', 'help', 'q'")
     ping_seq = 1
+
     while True:
+        print("[client] > ", end="", flush=True)
         try:
             command = input("[client] > ")
         except EOFError: # e.g. stdin closed
@@ -179,7 +250,10 @@ def interactive_loop(conn: Connection) -> None:
 
         normalized = command.strip().lower()
 
-        if not normalized or normalized == "ping":
+        if not normalized:
+            continue
+
+        if normalized == "ping":
             ping = {"type": "PING", "seq_num": ping_seq,
                     "timestamp": int(time.time() * 1000)}
             conn.send_pdu(ping)
@@ -199,76 +273,28 @@ def interactive_loop(conn: Connection) -> None:
             deck_list = _build_sample_deck(50)
             log(f"[client] sending PLAYER_READY player_id={player_id} deck_size={len(deck_list)}")
 
-            # remember our player id locally so handlers can identify the player in future PDUs
             client_state["player_id"] = player_id
             send_player_ready(conn, player_id, deck_list)
             continue
 
         if normalized.startswith("mulligan"):
             parts = command.strip().split()
-            if len(parts) < 2:
-                log("[client] usage: mulligan <mull|keep> [auto|<card_ids>]")
-                continue
-            verb = parts[1].lower()
-
-            player_id = client_state.get("player_id")
-            if player_id is None:
-                log("[client] you must `ready <player_id>` first")
-                continue
-
-            if client_state["last_game_state"] is None:
-                log("[client] no game state available yet")
-                continue
-
-            # takes the current hand from the last game state update, which is used to determine which cards can be bottomed during a mulligan decision.
-            state = client_state["last_game_state"].get("state", {})
-            hand_map = state.get("hand", {})
-            hand = hand_map.get(player_id, [])
-
-            if verb in ("mull", "mulligan"):
-                # send keep=False
-                send_mulligan_choice(conn, keep=False, cards_to_bottom=[])
-                log(f"[client] sent MULLIGAN_CHOICE keep=False")
-                continue
-
-            if verb == "keep":
-                # Case 1: Player chose automatic selection for cards to put at the bottom
-                if len(parts) >= 3 and parts[2].lower() == "auto":
-                    mulligan_count = client_state["mulligan_count"]
-                    cards_to_bottom = hand[:mulligan_count]
-                    send_mulligan_choice(conn, keep=True, cards_to_bottom=cards_to_bottom)
-                    log(f"[client] sent MULLIGAN_CHOICE keep=True auto bottom {cards_to_bottom}")
-                    continue
-
-                # Case 2: Player explicitly listed specific cards to put at the bottom
-                elif len(parts) >= 3:
-                    cards = parts[2:]
-                    send_mulligan_choice(conn, keep=True, cards_to_bottom=cards)
-                    log(f"[client] sent MULLIGAN_CHOICE keep=True bottom {cards}")
-                    continue
-
-                # Case 3: Player hasn't mulliganed (0 count), so no cards need to go to the bottom
-                elif client_state["mulligan_count"] == 0:
-                    send_mulligan_choice(conn, keep=True, cards_to_bottom=[])
-                    log("[client] sent MULLIGAN_CHOICE keep=True (no cards to bottom)")
-                    continue
-
-                # Case 4: Player has mulliganed but didn't specify cards to bottom
-                else:
-                    log("[client] must specify cards to bottom or use 'mulligan keep auto'")
-                    continue
+            handle_mulligan_command(conn, parts)
+            continue
 
         if normalized == "help":
             log("[client] commands:")
-            log("  ping                 send a PING")
+            log("  ping                  send a PING")
             log("  ready <player_id>     send PLAYER_READY with a sample deck")
             log("  mulligan mull         redraw (keep=false)")
             log("  mulligan keep auto    keep and bottom N random cards")
             log("  mulligan keep <ids>   keep and bottom the listed card ids")
-            log("  q                    quit")
+            log("  q                     quit")
             continue
 
         log(f"[client] unknown command: {command}")
+        continue
+
 
 def send_player_ready(conn: Connection, player_id: str, deck_list: list) -> None:
     global seq_num
