@@ -3,6 +3,7 @@ import json
 import socket
 import threading
 import time
+import random
 
 from network import protocol
 from network.protocol import (Connection, ConnectionClosed, ProtocolError, log)
@@ -22,35 +23,72 @@ client_state = {
     "last_priority_grant_seq": None,
     "last_phase_transition_seq": None,
     "last_any_server_seq": None,
+    "current_phase": None,
+    "active_player": None,
+    "has_priority": False,
+    "waiting_after_keep": False,
 }
+
+console_lock = threading.Lock()
+prompt_visible = False
+
+
+def show_prompt() -> None:
+    global prompt_visible
+
+    with console_lock:
+        if not prompt_visible:
+            print("[client] > ", end="", flush=True)
+            prompt_visible = True
+
+
+def clear_prompt() -> None:
+    global prompt_visible
+
+    with console_lock:
+        if prompt_visible:
+            print()
+            prompt_visible = False
+
+
+def consume_prompt() -> None:
+    global prompt_visible
+
+    with console_lock:
+        prompt_visible = False
 
 def _handle_game_state_update(conn: Connection, pdu: dict) -> None:
     state = pdu.get("state", {})
+
     client_state["last_game_state"] = pdu
     client_state["last_game_state_update_seq"] = pdu.get("seq_num")
+
     phase = state.get("phase")
+    client_state["current_phase"] = phase
+    client_state["active_player"] = state.get("active_player")
+
+    clear_prompt()
 
     if phase == "LOBBY":
+        client_state["waiting_after_keep"] = False
+        client_state["has_priority"] = False
         render_lobby_cli(state)
 
     elif phase == "MULLIGAN":
+        keep_status = state.get("keep_status", {})
+        client_state["waiting_after_keep"] = keep_status.get(client_state["player_id"], False)
+    
         render_mulligan_cli(state, client_state["player_id"])
 
-        # remember last game state so the interactive prompt can act accordingly (e.g. for mulligan decisions)
-        client_state["last_game_state"] = pdu
-        client_state["last_game_state_update_seq"] = pdu.get("seq_num")
-
-    elif phase == "UNTAP":
-        render_in_game_cli(state, client_state["player_id"])
-
     else:
-        log(f"[client] GAME_STATE_UPDATE with unhandled phase '{phase}': {state}")
+        render_in_game_cli(state, client_state["player_id"])
 
 
 def handle_mulligan_command(conn: Connection, parts: list) -> None:
     """Handle the 'mulligan' command from the interactive CLI."""
     if len(parts) < 2:
         log("[client] usage: mulligan <mull|keep> [auto|<card_ids>]")
+        show_prompt()
         return
 
     verb = parts[1].lower()
@@ -59,10 +97,12 @@ def handle_mulligan_command(conn: Connection, parts: list) -> None:
 
     if player_id is None:
         log("[client] you must `ready <player_id>` first")
+        show_prompt()
         return
 
     if client_state["last_game_state"] is None:
         log("[client] no game state available yet")
+        show_prompt()
         return
 
     # takes the current hand from the last game state update, which is used to determine which cards can be bottomed during a mulligan decision.
@@ -72,8 +112,11 @@ def handle_mulligan_command(conn: Connection, parts: list) -> None:
 
     if verb in ("mull", "mulligan"):
         # send keep=False
-        send_mulligan_choice(conn, keep=False, cards_to_bottom=[])
-        log(f"[client] sent MULLIGAN_CHOICE keep=False")
+        if send_mulligan_choice(conn, keep=False, cards_to_bottom=[]):
+            log("[client] sent MULLIGAN_CHOICE keep=False")
+        else:
+            show_prompt()
+
         return
 
     elif verb == "keep":
@@ -81,61 +124,85 @@ def handle_mulligan_command(conn: Connection, parts: list) -> None:
         if len(parts) >= 3 and parts[2].lower() == "auto":
             mulligan_count = client_state["mulligan_count"]
             cards_to_bottom = hand[:mulligan_count]
-            send_mulligan_choice(conn, keep=True, cards_to_bottom=cards_to_bottom)
-            log(f"[client] sent MULLIGAN_CHOICE keep=True auto bottom {cards_to_bottom}")
 
         # Case 2: Player explicitly listed specific cards to put at the bottom
         elif len(parts) >= 3:
-            cards = parts[2:]
-            send_mulligan_choice(conn, keep=True, cards_to_bottom=cards)
-            log(f"[client] sent MULLIGAN_CHOICE keep=True bottom {cards}")
+            cards_to_bottom = parts[2:]
 
         # Case 3: Player hasn't mulliganed (0 count), so no cards need to go to the bottom
         elif client_state["mulligan_count"] == 0:
-            send_mulligan_choice(conn, keep=True, cards_to_bottom=[])
-            log("[client] sent MULLIGAN_CHOICE keep=True (no cards to bottom)")
+            cards_to_bottom = []
 
         # Case 4: Player has mulliganed but didn't specify cards to bottom
         else:
             log("[client] must specify cards to bottom or use 'mulligan keep auto'")
+            show_prompt()
+            return
+
+        if send_mulligan_choice(conn, keep=True, cards_to_bottom=cards_to_bottom):
+            log(f"[client] sent MULLIGAN_CHOICE keep=True bottom {cards_to_bottom}")
+        else:
+            show_prompt()
+
+        return
 
     else:
         log(f"[client] unknown mulligan verb '{verb}' -- use 'mull' or 'keep'")
-
-    print("[client] > ", end="", flush=True)
+        show_prompt()
 
 def _handle_phase_transition(conn: Connection, pdu: dict) -> None:
-    log(f"[client] PHASE_TRANSITION: {pdu.get('from_phase')} -> {pdu.get('to_phase')} "
-        f"(active_player={pdu.get('active_player')} turn={pdu.get('turn')})")
+    clear_prompt()
 
     client_state["last_phase_transition_seq"] = pdu.get("seq_num")
 
     to_phase = pdu.get("to_phase")
+    client_state["current_phase"] = to_phase
+
     active_player = pdu.get("active_player")
+    client_state["active_player"] = active_player
+
     my_id = client_state["player_id"]
+
+    # Once the game leaves the Mulligan Phase, the player is no longer waiting
+    # for the other player's mulligan decision.
+    if to_phase != "MULLIGAN":
+        client_state["waiting_after_keep"] = False
+
+    log(f"[client] PHASE_TRANSITION: {pdu.get('from_phase')} -> {to_phase} "
+        f"(active_player={active_player} turn={pdu.get('turn')})")
 
     if to_phase == "DECLARE_ATTACKERS" and active_player == my_id:
         state = client_state["last_game_state"].get("state", {})
         battlefield = state.get("battlefield", {}).get(my_id, [])
+
         log(f"[client] your battlefield: {battlefield}")
         log("[client] type: attack <id1> <id2> ...  (or just 'attack' for none)")
+        show_prompt()
 
     elif to_phase == "DECLARE_BLOCKERS" and active_player != my_id:
         state = client_state["last_game_state"].get("state", {})
         battlefield = state.get("battlefield", {}).get(my_id, [])
+
         log(f"[client] your battlefield: {battlefield}")
         log("[client] type: block <attacker_id> <blocker_id>  (or just 'block' for none)")
+        show_prompt()
 
 
 def _handle_priority_grant(conn: Connection, pdu: dict) -> None:
-    log(f"[client] PRIORITY_GRANT: {pdu.get('player_id')} has priority "
+    clear_prompt()
+
+    player_id = pdu.get("player_id")
+
+    log(f"[client] PRIORITY_GRANT: {player_id} has priority "
         f"for {pdu.get('time_limit_ms')}ms")
 
-    if client_state["player_id"] == pdu.get("player_id"):
+    if client_state["player_id"] == player_id:
         client_state["has_priority"] = True
         client_state["last_priority_grant_seq"] = pdu.get("seq_num")
-
-    print("[client] > ", end="", flush=True)
+        show_prompt()
+    else:
+        client_state["has_priority"] = False
+        client_state["last_priority_grant_seq"] = None
 
 def _handle_stack_push(conn: Connection, pdu: dict) -> None:
     log(f"[client] STACK_PUSH: {pdu}")
@@ -153,75 +220,156 @@ def _handle_combat_damage_result(conn: Connection, pdu: dict) -> None:
     log(f"[client] COMBAT_DAMAGE_RESULT: {pdu}")
 
 def _handle_game_over(conn: Connection, pdu: dict) -> None:
-    # Since the game is over, a fresh match will be created and fields should'nt carry over.
-    # However, it is still worth resetting these fields to ensure that the client is in a 
+    clear_prompt()
+
+    # Since the game is over, a fresh match will be created and fields shouldn't carry over.
+    # However, it is still worth resetting these fields to ensure that the client is in a
     # clean state for the next match.
     client_state["mulligan_count"] = 0
     client_state["has_priority"] = False
+    client_state["last_priority_grant_seq"] = None
+    client_state["waiting_after_keep"] = False
 
     log(f"[client] GAME_OVER: winner={pdu.get('winner_id')} "
         f"loser={pdu.get('loser_id')} reason={pdu.get('reason')}")
     log("[client] returning to LOBBY -- type 'ready <player_id>' to start a new match")
+    log("")
 
 def _handle_error(conn: Connection, pdu: dict) -> None:
+    clear_prompt()
+
+    rejected_action = pdu.get("rejected_action", {})
+
+    # If a MULLIGAN_CHOICE was rejected, the player has not successfully kept yet,
+    # so they should be allowed to enter another mulligan command.
+    if rejected_action.get("type") == "MULLIGAN_CHOICE":
+        client_state["waiting_after_keep"] = False
+
     log(f"[client] ERROR: {pdu.get('code')} - {pdu.get('message')}")
+    show_prompt()
 
 def _handle_pong(conn: Connection, pdu: dict) -> None:
+    clear_prompt()
+
     now = int(time.time() * 1000)
     rtt = now - pdu["timestamp"]
+
     log(f"[client] PONG received (seq_num={pdu['seq_num']}), rtt={rtt}ms")
-    print("[client] > ", end="", flush=True)
+    show_prompt()
 
 
 # IN_GAME PDU send helpers
-def send_priority_pass(conn: Connection) -> None:
+def send_priority_pass(conn: Connection) -> bool:
     seq = client_state["last_priority_grant_seq"]
-    if seq is None:
-        log("[client] no PRIORITY_GRANT recorded -- cannot pass priority")
-        return
+
+    if not client_state["has_priority"] or seq is None:
+        log("[client] you do not currently have priority")
+        return False
+
     conn.send_pdu(pdu_builders.build_priority_pass(seq))
+
     client_state["has_priority"] = False
+    client_state["last_priority_grant_seq"] = None
+
+    return True
 
 
-def send_cast_spell(conn: Connection, card_id: str, targets: list) -> None:
+def send_cast_spell(conn: Connection, card_id: str, targets: list) -> bool:
     seq = client_state["last_priority_grant_seq"]
-    if seq is None:
-        log("[client] no PRIORITY_GRANT recorded -- cannot cast spell")
-        return
+
+    if not client_state["has_priority"] or seq is None:
+        log("[client] you do not currently have priority")
+        return False
+
     conn.send_pdu(pdu_builders.build_cast_spell(seq, card_id, list(targets), {}))
 
+    return True
 
-def send_play_land(conn: Connection, card_id: str) -> None:
+
+def send_play_land(conn: Connection, card_id: str) -> bool:
+    phase = client_state["current_phase"]
+    active_player = client_state["active_player"]
+    player_id = client_state["player_id"]
     seq = client_state["last_priority_grant_seq"]
+
+    if phase not in ("PRECOMBAT_MAIN", "POSTCOMBAT_MAIN"):
+        log("[client] PLAY_LAND is only legal during a Main phase.")
+        show_prompt()
+        return False
+
+    if active_player != player_id:
+        log("[client] you may only play a land on your own turn")
+        return False
+
     if seq is None:
         log("[client] no PRIORITY_GRANT recorded -- cannot play land")
-        return
-    conn.send_pdu(pdu_builders.build_play_land(seq, card_id))
-    log(f"[client] sent PLAY_LAND {card_id}")
+        show_prompt()
+        return False
 
-def send_declare_attackers(conn: Connection, attackers: list) -> None:
+    conn.send_pdu(pdu_builders.build_play_land(seq, card_id))
+    return True
+
+
+def send_declare_attackers(conn: Connection, attackers: list) -> bool:
+    # DECLARE_ATTACKERS is only valid during the Declare Attackers Step.
+    if client_state["current_phase"] != "DECLARE_ATTACKERS":
+        log("[client] cannot declare attackers outside the Declare Attackers Step")
+        show_prompt()
+        return False
+
+    # Only the Active Player may declare attackers.
+    if client_state["active_player"] != client_state["player_id"]:
+        log("[client] only the active player may declare attackers")
+        return False
+
     seq = client_state["last_phase_transition_seq"]
+
     if seq is None:
         log("[client] no PHASE_TRANSITION recorded -- cannot declare attackers")
-        return
+        return False
+
+    state = client_state["last_game_state"].get("state", {})
+    battlefield = state.get("battlefield", {}).get(client_state["player_id"], [])
+
+    # Each declared attacker must be a creature currently on this player's battlefield.
+    for attacker in attackers:
+        card_id = attacker["creature_id"]
+
+        if card_id not in battlefield:
+            log(f"[client] '{card_id}' is not on your battlefield")
+            return False
+
+        card = card_database.CARD_DATABASE.get(card_id)
+
+        if card is None or getattr(card, "card_type", None) != "Creature":
+            log(f"[client] '{card_id}' is not a creature")
+            return False
+
     conn.send_pdu(pdu_builders.build_declare_attackers(seq, attackers))
+    return True
 
 
-def send_declare_blockers(conn: Connection, blockers: list) -> None:
+def send_declare_blockers(conn: Connection, blockers: list) -> bool:
     seq = client_state["last_phase_transition_seq"]
+
     if seq is None:
         log("[client] no PHASE_TRANSITION recorded -- cannot declare blockers")
-        return
+        return False
+
     conn.send_pdu(pdu_builders.build_declare_blockers(seq, blockers))
+    return True
 
 
-def send_concede(conn: Connection) -> None:
+def send_concede(conn: Connection) -> bool:
     seq = client_state["last_any_server_seq"]
+
     if seq is None:
         log("[client] no server PDU recorded yet -- cannot concede")
-        return
+        return False
+
     pid = client_state["player_id"]
     conn.send_pdu(pdu_builders.build_concede(seq, pid))
+    return True
 
 
 def render_in_game_cli(state: dict, my_id: str) -> None:
@@ -252,11 +400,12 @@ def render_in_game_cli(state: dict, my_id: str) -> None:
     log("  phase                      -- print current phase")
     log("  help                       -- show commands")
     log("=" * width)
-    print("[client] > ", end="", flush=True)
+    log("")
 
 
 def _build_sample_deck(limit: int = 50) -> list:
     deck_ids = list(card_database.CARD_DATABASE.keys())
+    random.shuffle(deck_ids)
     if len(deck_ids) < limit:
         limit = len(deck_ids)
     return deck_ids[:limit]
@@ -269,14 +418,17 @@ def receive_loop(conn: Connection, stop_event: threading.Event) -> None:
         try:
             response = conn.recv_pdu()
         except ConnectionClosed:
-            log("[client] connection closed by server")
-            running = False
+            if not stop_event.is_set():
+                log("[client] connection closed by server")
+            break
         except ProtocolError as exc:
-            log(f"[client] protocol error during receive: {exc}")
-            running = False
+            if not stop_event.is_set():
+                log(f"[client] protocol error during receive: {exc}")
+            break
         except OSError as exc:
-            log(f"[client] socket error during receive: {exc}")
-            running = False
+            if not stop_event.is_set():
+                log(f"[client] socket error during receive: {exc}")
+            break
 
         client_state["last_any_server_seq"] = response.get("seq_num")
 
@@ -324,6 +476,10 @@ def run_self_test(conn: Connection) -> None:
 def interactive_loop(conn: Connection) -> None:
     ping_seq = 1
     while True:
+        if client_state["waiting_after_keep"]:
+            time.sleep(0.05)
+            continue
+        
         try:
             # "[client] >" is printed inside the CLI methods because this input() is called first
             # before the CLI methods are called, so the "[client] > " prompt is printed after the CLI output. 
@@ -368,72 +524,95 @@ def interactive_loop(conn: Connection) -> None:
 
         # In-game commands
         if normalized == "pass" or normalized == "priority_pass":
-            send_priority_pass(conn)
-            log("[client] sent PRIORITY_PASS")
+            if send_priority_pass(conn):
+                log("[client] sent PRIORITY_PASS")
             continue
-
+        
         if normalized.startswith("cast"):
             parts = command.strip().split()
+        
             if len(parts) < 2:
                 log("[client] usage: cast <card_id> [target1 target2 ...]")
                 continue
+        
             card_id = parts[1]
             targets = parts[2:]
-            send_cast_spell(conn, card_id, targets)
-            log(f"[client] sent CAST_SPELL {card_id} targets={targets}")
+        
+            if send_cast_spell(conn, card_id, targets):
+                log(f"[client] sent CAST_SPELL {card_id} targets={targets}")
+        
             continue
-
+        
         if normalized.startswith("playland"):
             parts = command.strip().split()
             if len(parts) < 2:
                 log("[client] usage: playland <card_id>")
                 continue
-            send_play_land(conn, parts[1])
+        
+            if send_play_land(conn, parts[1]):
+                log(f"[client] sent PLAY_LAND {parts[1]}")
+        
             continue
-
+        
         if normalized.startswith("attack"):
             parts = command.strip().split()
-            if len(parts) < 2:
-                log("[client] usage: attack <creature_id> [more_ids...]")
-                continue
+        
+            # An empty attacker list means the Active Player declares no attackers.
             attackers = [{"creature_id": cid, "target": None} for cid in parts[1:]]
-            send_declare_attackers(conn, attackers)
-            log(f"[client] sent DECLARE_ATTACKERS {attackers}")
+        
+            if send_declare_attackers(conn, attackers):
+                log(f"[client] sent DECLARE_ATTACKERS {attackers}")
+        
             continue
-
+        
         if normalized.startswith("block"):
             parts = command.strip().split()
+        
             if len(parts) < 2:
                 log("[client] usage: block attacker:blocker [more pairs...]")
                 continue
+        
             blockers = []
+        
             for pair in parts[1:]:
                 if ":" not in pair:
                     log(f"[client] invalid pair '{pair}', must be attacker:blocker")
                     continue
+        
                 atk, blk = pair.split(":", 1)
                 blockers.append({"creature_id": atk, "blocking_id": blk})
-            send_declare_blockers(conn, blockers)
-            log(f"[client] sent DECLARE_BLOCKERS {blockers}")
+        
+            if send_declare_blockers(conn, blockers):
+                log(f"[client] sent DECLARE_BLOCKERS {blockers}")
+        
             continue
-
+        
         if normalized == "concede":
-            send_concede(conn)
-            log("[client] sent CONCEDE")
+            if send_concede(conn):
+                log("[client] sent CONCEDE")
             continue
-
+        
         if normalized == "state":
             log(f"[client] last GAME_STATE_UPDATE: {client_state.get('last_game_state')}")
+            
+            if client_state["has_priority"]:
+                show_prompt()
+            
             continue
-
+        
         if normalized == "phase":
-            gs = client_state.get('last_game_state')
-            if gs:
-                log(f"[client] current phase: {gs.get('state', {}).get('phase')}")
+            phase = client_state.get("current_phase")
+        
+            if phase:
+                log(f"[client] current phase: {phase}")
             else:
-                log('[client] no game state yet')
+                log("[client] no game state yet")
+                
+            if client_state["has_priority"]:
+                show_prompt()
+        
             continue
-
+        
         if normalized == "help":
             log("[client] commands:")
             log("  ping                  send a PING")
@@ -442,9 +621,9 @@ def interactive_loop(conn: Connection) -> None:
             log("  mulligan keep auto    keep and bottom N random cards")
             log("  mulligan keep <ids>   keep and bottom the listed card ids")
             log("  q                     quit")
-            print("[client] > ", end="", flush=True)
+            show_prompt()
             continue
-
+        
         log(f"[client] unknown command: {command}")
         print("[client] > ", end="", flush=True)
         continue
@@ -466,13 +645,13 @@ def send_player_ready(conn: Connection, player_id: str, deck_list: list) -> None
     seq_num += 1
 
 
-def send_mulligan_choice(conn: Connection, keep: bool, cards_to_bottom: list) -> None:
+def send_mulligan_choice(conn: Connection, keep: bool, cards_to_bottom: list) -> bool:
     """Send a MULLIGAN_CHOICE PDU echoing the last GAME_STATE_UPDATE seq_num as per RFC 5.4"""
     seq = client_state["last_game_state_update_seq"]
 
     if seq is None:
         log("[client] no game state update recorded yet -- cannot send MULLIGAN_CHOICE")
-        return
+        return False
 
     conn.send_pdu({
         "type": "MULLIGAN_CHOICE",
@@ -483,6 +662,8 @@ def send_mulligan_choice(conn: Connection, keep: bool, cards_to_bottom: list) ->
 
     if not keep:
         client_state["mulligan_count"] += 1
+
+    return True
 
 
 def receive_and_handle(conn: Connection) -> None:
@@ -535,19 +716,13 @@ def main() -> None:
 
 def render_welcome_cli(host: str, port: int) -> None:
     width = 60
+
     log("=" * width)
     log("MTGNP CLIENT".center(width))
-    log("=" * width)
-    log(f" Connected to server: {host}:{port}")
     log("-" * width)
-    log(" Commands:")
-    log("   ready <player_id>   -- join with a sample deck")
-    log("   ping                -- send a heartbeat PING")
-    log("   help                -- show all commands")
-    log("   q                   -- quit")
+    log(f" Connected to server: {host}:{port}")
     log("=" * width)
-    log(" Waiting in LOBBY -- type 'ready <player_id>' to begin")
-    print("[client] > ", end="", flush=True)    
+    log("")
 
 
 def render_lobby_cli(state: dict) -> None:
@@ -555,20 +730,30 @@ def render_lobby_cli(state: dict) -> None:
     ready = state.get("players_ready")
     waiting_for = state.get("waiting_for", [])
 
-    log("=" * width)
-    log("LOBBY".center(width))
+    if ready == 0:
+        log("=" * width)
+        log("LOBBY".center(width))
+        log("-" * width)
+        log(" Commands:")
+        log("   ready <player_id>   -- join with a sample deck")
+        log("   ping                -- send a heartbeat PING")
+        log("   help                -- show all commands")
+        log("   q                   -- quit")
+        log("=" * width)
+        log(" Waiting in LOBBY -- type 'ready <player_id>' to begin")
+        show_prompt()
+        return
+
     log("=" * width)
     log(f" Players ready: {ready}/2")
+
     if waiting_for:
         log(f" Waiting on: {', '.join(waiting_for)}")
     else:
         log(" All players ready -- starting game...")
-    log("-" * 60)
-    log(" Commands:")
-    log("   ready <player_id>   -- send PLAYER_READY with a sample deck")
-    log("=" * 60)
-    print("[client] > ", end="", flush=True)
 
+    log("=" * width)
+    log("")
 
 def render_mulligan_cli(state: dict, my_id: str) -> None:
     """Display the current mulligan-phase state to the player."""
@@ -582,13 +767,23 @@ def render_mulligan_cli(state: dict, my_id: str) -> None:
     log(f" Turn {state.get('turn')}  |  Active player: {state.get('active_player')}")
     log(f" You have mulliganed {mulligan_count} time(s)")
     log(f" Your hand ({len(hand)}): {', '.join(hand) if hand else '(empty)'}")
+
+    # Once this player has submitted a keep, they should wait for the other
+    # player rather than receiving another mulligan prompt.
+    if client_state["waiting_after_keep"]:
+        log("-" * width)
+        log(" You have kept your hand.")
+        log(" Waiting for the other player to finish their mulligan...")
+        log("=" * width)
+        return
+
     log("-" * width)
     log(" Commands:")
     log("   mulligan mull            -- take a mulligan, draw a fresh 7")
     log("   mulligan keep auto       -- keep, auto-bottom the required cards")
     log("   mulligan keep <card_ids> -- keep, bottom these specific cards")
     log("=" * width)
-    print("[client] > ", end="", flush=True)
+    show_prompt()
 
 
 if __name__ == "__main__":

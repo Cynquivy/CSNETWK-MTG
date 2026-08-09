@@ -163,9 +163,19 @@ class GameServer:
 
         log(f"[server] {label} connected from {addr[0]}:{addr[1]} "
             f"({seated}/{MAX_PLAYERS} players)")
-
+        
         threading.Thread(target=self._serve_client, args=(label, conn),
                          daemon=True).start()
+        
+        if self.game_state.lifecycle_state == LifecycleState.LOBBY:
+            ready_labels = set(self.player_id_to_label.values())
+            waiting_for = [l for l in self.clients if l not in ready_labels]
+        
+            conn.send_pdu(pdu_builders.build_game_state_update_lobby(
+                seq_num=conn.next_seq(),
+                players_ready=len(self.pending_decks),
+                waiting_for=waiting_for,
+            ))
 
     def _next_free_label(self) -> str:
         for i in range(1, MAX_PLAYERS + 1):
@@ -300,12 +310,21 @@ class GameServer:
 
         log(f"[server] {label} ready as '{player_id}' "
             f"({players_ready}/{MAX_PLAYERS} players ready)")
-
+        
         if both_ready:
+            recipients = list(self.clients.values())
+        
+            for recv_conn in recipients:
+                recv_conn.send_pdu(pdu_builders.build_game_state_update_lobby(
+                    seq_num=recv_conn.next_seq(),
+                    players_ready=players_ready,
+                    waiting_for=[],
+                ))
+        
             log("[server] both players ready -- running GAME_SETUP (RFC 6.3)")
             self._run_game_setup()
             return
-
+        
         conn.send_pdu(pdu_builders.build_game_state_update_lobby(
             seq_num=conn.next_seq(),
             players_ready=players_ready,
@@ -465,11 +484,18 @@ class GameServer:
         for card_id in cards_to_bottom:
             p.hand.remove(card_id)
             p.library.insert(0, card_id)
+        
         p.keep_cards = True
-
+        
+        conn.send_pdu(pdu_builders.build_game_state_update_in_game(
+            seq_num=conn.next_seq(),
+            game_state=self.game_state,
+            viewer_player_id=player_id,
+        ))
+        
         log(f"[server] {player_id} kept their hand "
             f"(mulligan_count={p.mulligan_count})")
-
+        
         self._maybe_begin_in_game()
 
     def _maybe_begin_in_game(self) -> None:
@@ -556,7 +582,7 @@ class GameServer:
         self._run_phase_entry(next_phase)
 
     # I needed to add this because combat has two conditional skip logic
-    def _next_phase_after(self, current_phase) -> Phase:
+    def _next_phase_after(self, current_phase: Phase) -> Phase:
         """
         CONDITIONS FOR SPECIAL LOCIC:
           - Declare Blockers -> Assign Damage Order is skipped if nothing
@@ -609,9 +635,9 @@ class GameServer:
             self._run_first_strike_damage_step()
         elif phase is Phase.COMBAT_DAMAGE:
             self._run_combat_damage_step()
-        # else: DECLARE_ATTACKERS and later (Milestone #12). Nothing to do
-        # here; the PHASE_TRANSITION already broadcast above is the only
-        # signal RFC 9.3 defines for that step.
+        # DECLARE_ATTACKERS and DECLARE_BLOCKERS wait for their corresponding
+        # client declaration PDUs. The PHASE_TRANSITION itself signals the
+        # appropriate player to send the declaration.
 
     def _run_untap_step(self) -> None:
         """RFC 7.2: untap the Active Player's permanents, reset their land
@@ -634,35 +660,34 @@ class GameServer:
         self._advance_phase()
 
     def _run_draw_step(self) -> None:
-        """RFC 7.4: draw one card for the Active Player, except on the very
+        """
+        RFC 7.4: draw one card for the Active Player, except on the very
         first turn of the game, where no card is drawn but the
-        PHASE_TRANSITION and priority window still happen normally."""
+        PHASE_TRANSITION and priority window still happen normally.
+        """
         with self.lock:
             active = self.game_state.active_player
             skip_draw = self.game_state.turn == 1
             drew_successfully = True
+    
             if not skip_draw:
                 drew_successfully = active.draw_from_lib(1)
+    
             conn = self.clients[self.player_id_to_label[active.player_id]]
-
+    
         if not drew_successfully:
-            # RFC 6.5: "A player is required to draw a card from an empty
-            # library" is an IN_GAME loss condition. Detecting it here so
-            # the engine does not silently continue as if the draw
-            # succeeded; broadcasting GAME_OVER for it is Milestone #14's
-            # job, so the turn engine intentionally halts rather than
-            # opening a priority window on top of an unresolved loss.
             log(f"[server] {active.player_id} must draw from an empty library "
                 f"-- GAME_OVER handling is Milestone #14, halting here")
             return
-
-        if not skip_draw:
-            conn.send_pdu(pdu_builders.build_game_state_update_in_game(
-                seq_num=conn.next_seq(),
-                game_state=self.game_state,
-                viewer_player_id=active.player_id,
-            ))
-
+    
+        # RFC 7.4: send a personalized GAME_STATE_UPDATE to the Active Player.
+        # On turn 1, the first player's draw is skipped, so the hand remains unchanged.
+        conn.send_pdu(pdu_builders.build_game_state_update_in_game(
+            seq_num=conn.next_seq(),
+            game_state=self.game_state,
+            viewer_player_id=active.player_id,
+        ))
+    
         self._open_priority_window()
 
     def _run_cleanup_step(self) -> None:
@@ -2070,7 +2095,7 @@ class GameSession:
                     has_attackers = self.controller.declare_attackers()
 
                     if not has_attackers:
-                        self.controller.state.phase = Phase.COMBAT_ENDING
+                        self.controller.state.phase = Phase.END_OF_COMBAT
 
                 case Phase.DECLARE_BLOCKERS:
                     self.controller.declare_blockers()
@@ -2081,7 +2106,7 @@ class GameSession:
                 case Phase.COMBAT_EXECUTE:
                     self.controller.execute_combat()
 
-                case Phase.COMBAT_ENDING:
+                case Phase.END_OF_COMBAT:
                     self.controller.end_combat()
 
                 case Phase.MAIN_TWO:
@@ -2240,7 +2265,7 @@ class GameController:
             
             player = self.players[prio]
             
-            if prio == self.state.AP_idx and len(self.stack) == 0 and self.state.phase in (Phase.MAIN_ONE, Phase.MAIN_TWO):
+            if prio == self.state.AP_idx and len(self.stack) == 0 and self.state.phase in (Phase.PRECOMBAT_MAIN, Phase.POSTCOMBAT_MAIN):
                 action = self.game_ui.get_main_phase_action(player)
             else:
                 action = self.game_ui.get_priority_action(player)
@@ -2251,7 +2276,7 @@ class GameController:
                 can_play_land = (
                     len(self.stack) == 0
                     and prio == self.state.AP_idx
-                    and self.state.phase in (Phase.MAIN_ONE, Phase.MAIN_TWO)
+                    and self.state.phase in (Phase.PRECOMBAT_MAIN, Phase.POSTCOMBAT_MAIN)
                     and land is not None
                     and land in player.hand
                     and not player.land_played_this_turn
@@ -2377,7 +2402,7 @@ class GameController:
     def can_cast_creature(self, player, card):
         return (
             player == self.players[self.state.AP_idx]
-            and self.state.phase in (Phase.MAIN_ONE, Phase.MAIN_TWO)
+            and self.state.phase in (Phase.PRECOMBAT_MAIN, Phase.POSTCOMBAT_MAIN)
             and len(self.stack) == 0
             and isinstance(card, creature)
             and card in player.hand
@@ -2451,7 +2476,7 @@ class GameController:
         if isinstance(card, (sorcery, artifact, enchantment)):
             return (
                 player == self.players[self.state.AP_idx]
-                and self.state.phase in (Phase.MAIN_ONE, Phase.MAIN_TWO)
+                and self.state.phase in (Phase.PRECOMBAT_MAIN, Phase.POSTCOMBAT_MAIN)
                 and len(self.stack) == 0
             )
     
@@ -2482,22 +2507,24 @@ class GameState:
             case Phase.UPKEEP:
                 self.phase = Phase.DRAW
             case Phase.DRAW:
-                self.phase = Phase.MAIN_ONE
-            case Phase.MAIN_ONE:
-                self.phase = Phase.COMBAT_BEGINNING
-            case Phase.COMBAT_BEGINNING:
+                self.phase = Phase.PRECOMBAT_MAIN
+            case Phase.PRECOMBAT_MAIN:
+                self.phase = Phase.BEGIN_COMBAT
+            case Phase.BEGIN_COMBAT:
                 self.phase = Phase.DECLARE_ATTACKERS
             case Phase.DECLARE_ATTACKERS:
                 self.phase = Phase.DECLARE_BLOCKERS
             case Phase.DECLARE_BLOCKERS:
                 self.phase = Phase.ASSIGN_DAMAGE_ORDER
             case Phase.ASSIGN_DAMAGE_ORDER:
-                self.phase = Phase.COMBAT_EXECUTE
-            case Phase.COMBAT_EXECUTE:
-                self.phase = Phase.COMBAT_ENDING
-            case Phase.COMBAT_ENDING:
-                self.phase = Phase.MAIN_TWO
-            case Phase.MAIN_TWO:
+                self.phase = Phase.FIRST_STRIKE_DAMAGE
+            case Phase.FIRST_STRIKE_DAMAGE:
+                self.phase = Phase.COMBAT_DAMAGE
+            case Phase.COMBAT_DAMAGE:
+                self.phase = Phase.END_OF_COMBAT
+            case Phase.END_OF_COMBAT:
+                self.phase = Phase.POSTCOMBAT_MAIN
+            case Phase.POSTCOMBAT_MAIN:
                 self.phase = Phase.END_STEP
             case Phase.END_STEP:
                 self.phase = Phase.CLEANUP

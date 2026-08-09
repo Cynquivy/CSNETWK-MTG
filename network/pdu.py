@@ -147,6 +147,10 @@ def build_game_state_update_in_game(seq_num, game_state, viewer_player_id) -> di
         ),
         "library_counts": game_state.library_counts,
         "land_played_this_turn": game_state.land_played_this_turn,
+        "keep_status": {
+            pid: p.keep_cards
+            for pid, p in game_state.players.items()
+        },
     }
     return {"type": "GAME_STATE_UPDATE", "seq_num": seq_num, "state": state}
 
