@@ -103,6 +103,7 @@ class GameServer:
         self._trigger_priority_recipient = None
 
         self._damage_order_pending = set()
+        self._discard_pending_for = None
 
         # handler table to call the corresponding method of each pdu type
         self._handlers = {
@@ -698,6 +699,8 @@ class GameServer:
         with self.lock:
             active = self.game_state.active_player
             needs_discard = len(active.hand) > 7
+            if needs_discard:
+                self._discard_pending_for = active.player_id
             conn = self.clients[self.player_id_to_label[active.player_id]] if needs_discard else None
 
         if needs_discard:
@@ -706,10 +709,20 @@ class GameServer:
                 game_state=self.game_state,
                 viewer_player_id=active.player_id,
             ))
-            log(f"[server] {active.player_id} must discard to 7 "
-                f"-- awaiting DISCARD (Milestone #13)")
+            log(f"[server] {active.player_id} must discard to 7 -- awaiting DISCARD")
             return
 
+        self._finish_cleanup_step()
+
+    # this needed to be split for card discard cleanup
+    def _finish_cleanup_step(self) -> None:
+        """
+        RFC 7.8 tail end: clear damage and until-end-of-turn stat changes,
+        broadcast the cleared state to both players, then increment the turn
+        counter, flip the Active Player, and begin the next turn's Untap
+        Step. Shared by the no-discard-needed path in _run_cleanup_step and
+        by _handle_discard once a discard round brings the hand to <= 7.
+        """
         with self.lock:
             for p in self.game_state.players.values():
                 for permanent in p.board:
@@ -1991,7 +2004,79 @@ class GameServer:
         ))
 
     def _handle_discard(self, label: str, conn: Connection, pdu: dict) -> None:
-        pass
+        if self.game_state.lifecycle_state != LifecycleState.IN_GAME or \
+           self.game_state.phase is not Phase.CLEANUP:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="WRONG_PHASE",
+                message="DISCARD is only valid during the Cleanup Step.",
+                rejected_action=pdu
+            ))
+            return
+
+        player_id = getattr(conn, "player_id", None)
+        if player_id is None or player_id != self._discard_pending_for:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="ILLEGAL_ACTION",
+                message="No discard is currently pending for you.",
+                rejected_action=pdu
+            ))
+            return
+
+        if conn.is_stale(pdu):
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="STALE_ACTION",
+                message=(f"seq_num mismatch. Expected "
+                         f"{conn.expected_seq_for('DISCARD')}, got {pdu.get('seq_num')}."),
+                rejected_action=pdu))
+            return
+
+        p = self.game_state.players[player_id]
+        card_ids = pdu.get("card_ids")
+
+        if not isinstance(card_ids, list) or len(card_ids) == 0:
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="ILLEGAL_ACTION",
+                message="card_ids must be a non-empty list.",
+                rejected_action=pdu
+            ))
+            return
+
+        hand_copy = list(p.hand)
+        for card_id in card_ids:
+            if card_id not in hand_copy:
+                conn.send_pdu(pdu_builders.build_error(
+                    seq_num=conn.next_seq(),
+                    code="ILLEGAL_ACTION",
+                    message=f"'{card_id}' is not in your hand.",
+                    rejected_action=pdu))
+                return
+            hand_copy.remove(card_id)
+
+        with self.lock:
+            for card_id in card_ids:
+                p.hand.remove(card_id)
+                p.graveyard.append(card_id)
+
+        log(f"[server] {player_id} discarded {card_ids} "
+            f"(hand now {len(p.hand)} card(s))")
+
+        # IF NOT REDUCED BY 7, STILL NEEDS MORE DISCARDS
+        if len(p.hand) > 7:
+            with self.lock:
+                recipients = [(pid, self.clients[self.player_id_to_label[pid]])
+                              for pid in self.game_state.players]
+            for pid, c in recipients:
+                c.send_pdu(pdu_builders.build_game_state_update_in_game(
+                    seq_num=c.next_seq(), game_state=self.game_state, viewer_player_id=pid))
+            return
+
+        # this is only reached when hand is <= 7
+        self._discard_pending_for = None
+        self._finish_cleanup_step()
 
     def _handle_concede(self, label: str, conn: Connection, pdu: dict) -> None:
         # RFC 5.4: CONCEDE may be sent at any time regardless of which player holds 
