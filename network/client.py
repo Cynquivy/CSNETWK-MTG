@@ -27,6 +27,7 @@ client_state = {
     "active_player": None,
     "has_priority": False,
     "waiting_after_keep": False,
+    "awaiting_action": None,
 }
 
 console_lock = threading.Lock()
@@ -172,6 +173,7 @@ def _handle_phase_transition(conn: Connection, pdu: dict) -> None:
         f"(active_player={active_player} turn={pdu.get('turn')})")
 
     if to_phase == "DECLARE_ATTACKERS" and active_player == my_id:
+        client_state["awaiting_action"] = "DECLARE_ATTACKERS"
         state = client_state["last_game_state"].get("state", {})
         battlefield = state.get("battlefield", {}).get(my_id, [])
 
@@ -180,6 +182,7 @@ def _handle_phase_transition(conn: Connection, pdu: dict) -> None:
         show_prompt()
 
     elif to_phase == "DECLARE_BLOCKERS" and active_player != my_id:
+        client_state["awaiting_action"] = "DECLARE_BLOCKERS"
         state = client_state["last_game_state"].get("state", {})
         battlefield = state.get("battlefield", {}).get(my_id, [])
 
@@ -263,7 +266,7 @@ def send_priority_pass(conn: Connection) -> bool:
     seq = client_state["last_priority_grant_seq"]
 
     if not client_state["has_priority"] or seq is None:
-        log("[client] you do not currently have priority")
+        log("[client] You do not currently have priority")
         return False
 
     conn.send_pdu(pdu_builders.build_priority_pass(seq))
@@ -346,6 +349,7 @@ def send_declare_attackers(conn: Connection, attackers: list) -> bool:
             return False
 
     conn.send_pdu(pdu_builders.build_declare_attackers(seq, attackers))
+    client_state["awaiting_action"] = None
     return True
 
 
@@ -357,6 +361,7 @@ def send_declare_blockers(conn: Connection, blockers: list) -> bool:
         return False
 
     conn.send_pdu(pdu_builders.build_declare_blockers(seq, blockers))
+    client_state["awaiting_action"] = None
     return True
 
 
@@ -524,8 +529,16 @@ def interactive_loop(conn: Connection) -> None:
 
         # In-game commands
         if normalized == "pass" or normalized == "priority_pass":
+            awaiting = client_state.get("awaiting_action")
+            if awaiting == "DECLARE_ATTACKERS":
+                log("[client] You must declare attackers first -- type 'attack <ids>' or 'attack' for none")
+                continue
+            if awaiting == "DECLARE_BLOCKERS":
+                log("[client] You must declare blockers first -- type 'block <ids>' or 'block' for none")
+                continue
             if send_priority_pass(conn):
                 log("[client] sent PRIORITY_PASS")
+            print("[client] > ", end="", flush=True)
             continue
         
         if normalized.startswith("cast"):
