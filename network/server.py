@@ -677,8 +677,11 @@ class GameServer:
             conn = self.clients[self.player_id_to_label[active.player_id]]
     
         if not drew_successfully:
-            log(f"[server] {active.player_id} must draw from an empty library "
-                f"-- GAME_OVER handling is Milestone #14, halting here")
+            # RFC 6.5: "A player is required to draw a card from an empty
+            # library" is an immediate win/loss condition -- the winner is
+            # the player who did not trigger it (RFC 6.6).
+            winner_id = self.game_state.opponent_of(active.player_id).player_id
+            self._end_game(winner_id=winner_id, loser_id=active.player_id, reason="DECK_EMPTY")
             return
     
         # RFC 7.4: send a personalized GAME_STATE_UPDATE to the Active Player.
@@ -838,7 +841,43 @@ class GameServer:
             player_ids = set(self.game_state.players.keys())
         return all(t in player_ids or t in permanent_ids for t in targets)
 
-    def _check_state_based_actions(self) -> bool:
+    def _end_game(self, winner_id: str, loser_id: str, reason: str) -> None:
+        """RFC 6.6: broadcast GAME_OVER (reason MUST be one of LIFE_ZERO |
+        DECK_EMPTY | CONCEDE | DISCONNECT) to both players, then
+        immediately reset to LOBBY state on the same TCP connections."""
+        with self.lock:
+            recipients = [self.clients[self.player_id_to_label[pid]]
+                          for pid in self.game_state.players]
+
+        for conn in recipients:
+            conn.send_pdu(pdu_builders.build_game_over(
+                seq_num=conn.next_seq(),
+                winner_id=winner_id,
+                loser_id=loser_id,
+                reason=reason,
+            ))
+
+        with self.lock:
+            self.game_state = ModelGameState()          # creates a fresh state for the next match
+            self.player_id_to_label.clear()
+            self.pending_decks.clear()
+            self.game_state.lifecycle_state = LifecycleState.LOBBY
+            recipients = list(self.clients.values())
+
+        # RFC 6.6: After broadcasting GAME_OVER, the server MUST return to the LOBBY
+        # state and await new PLAYER_READY PDUs on the same TCP connections, allowing
+        # the same two players to start a new game without reconnecting.
+        for conn in recipients:
+            conn.send_pdu(pdu_builders.build_game_state_update_lobby(
+                seq_num=conn.next_seq(),
+                players_ready=0,
+                waiting_for=list(self.clients.keys()),
+            ))
+
+        log(f"[server] GAME_OVER ({reason}): winner={winner_id} loser={loser_id} "
+            f"-- returned to LOBBY state")
+
+    def _check_state_based_actions(self) -> tuple[str, str] | None:
         """
         RFC 8.4: checked after every game event, before any priority is
         granted. Applies repeatedly until stable: creatures with lethal
@@ -847,11 +886,12 @@ class GameServer:
         Placing resulting triggers on the Stack is Milestone #10's job
         (no trigger detection exists yet, so there is nothing to place).
 
-        Returns True if a game-ending condition was found. Actually
-        broadcasting GAME_OVER and resetting to LOBBY is Milestone #14's
-        job (same boundary as the empty-library check in
-        GameServer._run_draw_step) -- this only detects and logs, so
-        callers know to stop advancing as if nothing happened.
+        Returns (winner_id, loser_id) if a LIFE_ZERO condition was found,
+        else None. This only detects the condition and cleans up dead
+        creatures -- callers are responsible for passing the result to
+        _end_game() (reason="LIFE_ZERO") per the RFC 8.4/Examples.pdf
+        Step 32 ordering: no further GAME_STATE_UPDATE is broadcast once
+        a game-ending condition is found, GAME_OVER follows immediately.
         """
         with self.lock:
             changed = True
@@ -869,16 +909,14 @@ class GameServer:
             active_id = self.game_state.active_player_id
 
         if not losers:
-            return False
+            return None
 
         # RFC 8.4: "If both players' life totals reach zero or less
         # simultaneously ... the Active Player loses and the Non-Active
         # Player wins."
         loser_id = active_id if len(losers) == 2 else losers[0]
         winner_id = self.game_state.opponent_of(loser_id).player_id
-        log(f"[server] LIFE_ZERO: {loser_id} has lost, {winner_id} would win "
-            f"-- GAME_OVER broadcast + LOBBY reset is Milestone #14, halting here")
-        return True
+        return winner_id, loser_id
 
     def _resolve_top_of_stack(self) -> None:
         """
@@ -916,6 +954,11 @@ class GameServer:
 
         game_over = self._check_state_based_actions()
 
+        if game_over:
+            winner_id, loser_id = game_over
+            self._end_game(winner_id=winner_id, loser_id=loser_id, reason="LIFE_ZERO")
+            return
+
         with self.lock:
             recipients2 = [(pid, self.clients[self.player_id_to_label[pid]])
                            for pid in self.game_state.players]
@@ -925,9 +968,6 @@ class GameServer:
                 game_state=self.game_state,
                 viewer_player_id=player_id,
             ))
-
-        if game_over:
-            return
 
         # RFC 8.1 rule 5: "The Active Player then receives priority again."
         self._open_priority_window()
@@ -1841,12 +1881,14 @@ class GameServer:
 
         game_over = self._check_state_based_actions()
 
+        if game_over:
+            winner_id, loser_id = game_over
+            self._end_game(winner_id=winner_id, loser_id=loser_id, reason="LIFE_ZERO")
+            return
+
         for player_id, c in recipients:
             c.send_pdu(pdu_builders.build_game_state_update_in_game(
                 seq_num=c.next_seq(), game_state=self.game_state, viewer_player_id=player_id))
-
-        if game_over:
-            return
 
         self._open_priority_window()
 
@@ -1866,15 +1908,17 @@ class GameServer:
                 seq_num=c.next_seq(), damage_events=damage_events,
                 life_totals=life_totals, creatures_died=creatures_died))
 
+        if game_over:
+            winner_id, loser_id = game_over
+            self._end_game(winner_id=winner_id, loser_id=loser_id, reason="LIFE_ZERO")
+            return
+
         with self.lock:
             recipients2 = [(pid, self.clients[self.player_id_to_label[pid]])
                            for pid in self.game_state.players]
         for player_id, c in recipients2:
             c.send_pdu(pdu_builders.build_game_state_update_in_game(
                 seq_num=c.next_seq(), game_state=self.game_state, viewer_player_id=player_id))
-
-        if game_over:
-            return
 
         self._advance_phase()
 
@@ -2106,38 +2150,7 @@ class GameServer:
         # determine the winner: the other registered player.
         winner_id = next((pid for pid in self.game_state.players if pid != player_id), None)
 
-        log(f"[server] {player_id} conceded -- winner={winner_id}")
-
-        with self.lock:
-            recipients = [self.clients[self.player_id_to_label[pid]]
-                        for pid in self.game_state.players]
-
-        for recv_conn in recipients:
-            recv_conn.send_pdu(pdu_builders.build_game_over(
-                seq_num=recv_conn.next_seq(),
-                winner_id=winner_id,
-                loser_id=player_id,
-                reason="CONCEDE",
-            ))
-
-        with self.lock:
-            self.game_state = ModelGameState()          # creates a fresh state for the next match
-            self.player_id_to_label.clear()
-            self.pending_decks.clear()
-            self.game_state.lifecycle_state = LifecycleState.LOBBY
-            recipients = list(self.clients.values())
-
-        # RFC 6.1: After broadcasting GAME_OVER, the server MUST return to the LOBBY 
-        # state and await new PLAYER_READY PDUs on the same TCP connections, allowing 
-        # the same two players to start a new game without reconnecting.
-        for recv_conn in recipients:
-            recv_conn.send_pdu(pdu_builders.build_game_state_update_lobby(
-                seq_num=recv_conn.next_seq(),
-                players_ready=0,
-                waiting_for=list(self.clients.keys()),
-            ))
-
-        log("[server] returned to LOBBY state after CONCEDE")
+        self._end_game(winner_id=winner_id, loser_id=player_id, reason="CONCEDE")
 
     def _handle_ping(self, label: str, conn: Connection, pdu: dict) -> None:
         conn.send_pdu({
