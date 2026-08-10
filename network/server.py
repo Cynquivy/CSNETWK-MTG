@@ -28,6 +28,8 @@ from model.game_state import GameState as ModelGameState
 from model.lifecycle import LifecycleState
 
 MAX_PLAYERS = 2
+# RFC 4.2 / 10.2.5: the time_limit_ms advertised in every PRIORITY_GRANT.
+PRIORITY_TIME_LIMIT_MS = 60000
 
 
 class _PendingTrigger:
@@ -104,6 +106,18 @@ class GameServer:
 
         self._damage_order_pending = set()
         self._discard_pending_for = None
+
+        # RFC 4.2 ("Enforce the time_limit_ms advertised in each
+        # PRIORITY_GRANT. If the priority-holding client does not respond
+        # before the deadline, the server MUST broadcast GAME_OVER with
+        # reason DISCONNECT..."): _priority_timer is the pending
+        # threading.Timer for the most recently issued PRIORITY_GRANT (or
+        # None if no deadline is currently armed). _priority_epoch is
+        # bumped every time the timer is (re)armed or cancelled, so a
+        # timer callback that fires after being superseded can recognize
+        # it is stale and no-op instead of acting on a closed window.
+        self._priority_timer = None
+        self._priority_epoch = 0
 
         # handler table to call the corresponding method of each pdu type
         self._handlers = {
@@ -757,12 +771,68 @@ class GameServer:
         with self.lock:
             self._priority_passes = 0
             self.game_state.priority_holder_id = self.game_state.active_player_id
-            conn = self.clients[self.player_id_to_label[self.game_state.active_player_id]]
+            active_player_id = self.game_state.active_player_id
+
+        self._send_priority_grant(active_player_id)
+
+    def _send_priority_grant(self, player_id: str, conn: Connection | None = None) -> None:
+        """RFC 10.2.5: issue a PRIORITY_GRANT to player_id, then arm (or
+        re-arm) the RFC 4.2 response deadline the server MUST enforce
+        against it. Any previously pending deadline is superseded."""
+        if conn is None:
+            with self.lock:
+                conn = self.clients[self.player_id_to_label[player_id]]
 
         conn.send_pdu(pdu_builders.build_priority_grant(
             seq_num=conn.next_seq(),
-            player_id=self.game_state.active_player_id,
+            player_id=player_id,
+            time_limit_ms=PRIORITY_TIME_LIMIT_MS,
         ))
+        self._arm_priority_timeout(player_id)
+
+    def _arm_priority_timeout(self, player_id: str) -> None:
+        with self.lock:
+            if self._priority_timer is not None:
+                self._priority_timer.cancel()
+            self._priority_epoch += 1
+            epoch = self._priority_epoch
+            timer = threading.Timer(
+                PRIORITY_TIME_LIMIT_MS / 1000.0,
+                self._on_priority_timeout,
+                args=(player_id, epoch),
+            )
+            timer.daemon = True
+            self._priority_timer = timer
+            timer.start()
+
+    def _cancel_priority_timeout(self) -> None:
+        """Stop enforcing the current PRIORITY_GRANT deadline without
+        arming a replacement -- used when a priority window closes
+        without an immediate re-grant (e.g. RFC 8.6.1: "Priority MUST NOT
+        be granted until all pending trigger ordering decisions and
+        optional trigger choices have been resolved")."""
+        with self.lock:
+            if self._priority_timer is not None:
+                self._priority_timer.cancel()
+                self._priority_timer = None
+            self._priority_epoch += 1
+
+    def _on_priority_timeout(self, player_id: str, epoch: int) -> None:
+        with self.lock:
+            still_current = (
+                epoch == self._priority_epoch
+                and self.game_state.lifecycle_state == LifecycleState.IN_GAME
+                and self.game_state.priority_holder_id == player_id
+            )
+            winner = self.game_state.opponent_of(player_id) if still_current else None
+
+        if winner is None:
+            return
+
+        log(f"[server] priority timeout: {player_id} did not respond within "
+            f"{PRIORITY_TIME_LIMIT_MS}ms of its PRIORITY_GRANT -- treating as "
+            f"DISCONNECT (RFC 4.2)")
+        self._end_game(winner_id=winner.player_id, loser_id=player_id, reason="DISCONNECT")
 
     def _handle_priority_pass(self, label: str, conn: Connection, pdu: dict) -> None:
         if self.game_state.lifecycle_state != LifecycleState.IN_GAME:
@@ -789,6 +859,14 @@ class GameServer:
             conn.send_pdu(error)
             conn.send_pdu(grant)
             return
+
+        # RFC 4.2: a legitimate PRIORITY_PASS is always a timely response
+        # to the outstanding PRIORITY_GRANT -- it either hands priority to
+        # the other player, resolves the Stack, or ends the step, never
+        # "try again in this same window". Stop enforcing the deadline
+        # this pass just satisfied; whichever branch below runs next will
+        # re-arm it if (and only if) a new window/grant follows.
+        self._cancel_priority_timeout()
 
         advance = False
         resolve = False
@@ -817,10 +895,7 @@ class GameServer:
         elif resolve:
             self._resolve_top_of_stack()
         else:
-            next_holder_conn.send_pdu(pdu_builders.build_priority_grant(
-                seq_num=next_holder_conn.next_seq(),
-                player_id=next_holder_id,
-            ))
+            self._send_priority_grant(next_holder_id, conn=next_holder_conn)
 
     def _next_stack_item_id(self) -> str:
         self._stack_id_counter += 1
@@ -845,6 +920,12 @@ class GameServer:
         """RFC 6.6: broadcast GAME_OVER (reason MUST be one of LIFE_ZERO |
         DECK_EMPTY | CONCEDE | DISCONNECT) to both players, then
         immediately reset to LOBBY state on the same TCP connections."""
+        # Whatever ended the game makes any still-pending RFC 4.2 priority
+        # deadline moot; invalidate it so a race with an in-flight
+        # _on_priority_timeout() can't fire a second, conflicting
+        # GAME_OVER (e.g. a DISCONNECT timeout racing a LIFE_ZERO SBA).
+        self._cancel_priority_timeout()
+
         with self.lock:
             recipients = [self.clients[self.player_id_to_label[pid]]
                           for pid in self.game_state.players]
@@ -1091,9 +1172,14 @@ class GameServer:
                 retain_priority_for=player_id,
             )
 
-        if not triggered:
-            conn.send_pdu(pdu_builders.build_priority_grant(
-                seq_num=conn.next_seq(), player_id=player_id))
+        if triggered:
+            # RFC 8.6.1: "Priority MUST NOT be granted until all pending
+            # trigger ordering decisions ... have been resolved" -- no
+            # grant means no deadline to enforce until that workflow
+            # (which itself calls _send_priority_grant) finishes.
+            self._cancel_priority_timeout()
+        else:
+            self._send_priority_grant(player_id, conn=conn)
 
     def _handle_activate_ability(self, label: str, conn: Connection, pdu: dict) -> None:
         if self.game_state.lifecycle_state != LifecycleState.IN_GAME:
@@ -1187,8 +1273,7 @@ class GameServer:
         for c in recipients:
             c.send_pdu(pdu_builders.build_stack_push(seq_num=c.next_seq(), stack_item=item))
 
-        conn.send_pdu(pdu_builders.build_priority_grant(
-            seq_num=conn.next_seq(), player_id=player_id))
+        self._send_priority_grant(player_id, conn=conn)
 
     ### TRIGGERED ABILITIES (RFC Section 8.6) ###
 
@@ -1353,9 +1438,7 @@ class GameServer:
                 with self.lock:
                     self._priority_passes = 0
                     self.game_state.priority_holder_id = recipient
-                    conn = self.clients[self.player_id_to_label[recipient]]
-                conn.send_pdu(pdu_builders.build_priority_grant(
-                    seq_num=conn.next_seq(), player_id=recipient))
+                self._send_priority_grant(recipient)
             return
 
         trigger, *rest = queue
@@ -2041,11 +2124,7 @@ class GameServer:
                 viewer_player_id=pid,
             ))
 
-        active_conn = self.clients[self.player_id_to_label[self.game_state.active_player_id]]
-        active_conn.send_pdu(pdu_builders.build_priority_grant(
-            seq_num=active_conn.next_seq(),
-            player_id=self.game_state.active_player_id,
-        ))
+        self._send_priority_grant(self.game_state.active_player_id)
 
     def _handle_discard(self, label: str, conn: Connection, pdu: dict) -> None:
         if self.game_state.lifecycle_state != LifecycleState.IN_GAME or \
