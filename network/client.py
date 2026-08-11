@@ -28,6 +28,10 @@ client_state = {
     "has_priority": False,
     "waiting_after_keep": False,
     "awaiting_action": None,
+    "last_trigger_order_seq": None,
+    "last_trigger_order_ids": None,      # so the client can validate its own response client-side
+    "last_trigger_choice_seq": None,
+    "last_trigger_choice_id": None,
 }
 
 console_lock = threading.Lock()
@@ -221,10 +225,15 @@ def _handle_stack_push(conn: Connection, pdu: dict) -> None:
     log(f"[client] STACK_PUSH: {pdu}")
 
 def _handle_trigger_order(conn: Connection, pdu: dict) -> None:
-    log(f"[client] TRIGGER_ORDER: {pdu}")
+    log(f"[client] TRIGGER_ORDER: choose order for triggers {pdu.get('trigger_ids')}")
+    client_state["last_trigger_order_seq"] = pdu.get("seq_num")
+    client_state["last_trigger_order_ids"] = pdu.get("trigger_ids")
 
 def _handle_trigger_choice(conn: Connection, pdu: dict) -> None:
-    log(f"[client] TRIGGER_CHOICE: {pdu}")
+    log(f"[client] TRIGGER_CHOICE: {pdu.get('effect_summary')} "
+        f"(requires_target={pdu.get('requires_target')}, legal_targets={pdu.get('legal_targets')})")
+    client_state["last_trigger_choice_seq"] = pdu.get("seq_num")
+    client_state["last_trigger_choice_id"] = pdu.get("trigger_id")
 
 def _handle_stack_resolve(conn: Connection, pdu: dict) -> None:
     log(f"[client] STACK_RESOLVE: {pdu}")
@@ -372,6 +381,51 @@ def send_declare_blockers(conn: Connection, blockers: list) -> bool:
 
     conn.send_pdu(pdu_builders.build_declare_blockers(seq, blockers))
     client_state["awaiting_action"] = None
+    return True
+
+
+def send_activate_ability(conn: Connection, source_id: str, ability_index: int, targets: list) -> bool:
+    seq = client_state["last_priority_grant_seq"]
+    if seq is None:
+        log("[client] no PRIORITY_GRANT recorded -- cannot activate ability")
+        return False
+    conn.send_pdu(pdu_builders.build_activate_ability(seq, source_id, ability_index, targets))
+    return True
+
+
+def send_assign_damage_order(conn: Connection, attacker_id: str, blocker_order: list) -> bool:
+    seq = client_state["last_phase_transition_seq"]
+    if seq is None:
+        log("[client] no PHASE_TRANSITION recorded -- cannot assign damage order")
+        return False
+    conn.send_pdu(pdu_builders.build_assign_damage_order(seq, attacker_id, blocker_order))
+    return True
+
+
+def send_trigger_order_response(conn: Connection, ordered_trigger_ids: list) -> bool:
+    seq = client_state["last_trigger_order_seq"]
+    if seq is None:
+        log("[client] no TRIGGER_ORDER recorded -- cannot respond")
+        return False
+    expected = client_state["last_trigger_order_ids"]
+    if expected is not None and set(ordered_trigger_ids) != set(expected):
+        log(f"[client] ordered_trigger_ids must contain exactly {expected}")
+        return False
+    conn.send_pdu(pdu_builders.build_trigger_order_response(seq, ordered_trigger_ids))
+    client_state["last_trigger_order_seq"] = None
+    client_state["last_trigger_order_ids"] = None
+    return True
+
+
+def send_trigger_choice_response(conn: Connection, accept: bool, chosen_target: str = None) -> bool:
+    seq = client_state["last_trigger_choice_seq"]
+    if seq is None:
+        log("[client] no TRIGGER_CHOICE recorded -- cannot respond")
+        return False
+    trigger_id = client_state["last_trigger_choice_id"]
+    conn.send_pdu(pdu_builders.build_trigger_choice_response(seq, trigger_id, accept, chosen_target))
+    client_state["last_trigger_choice_seq"] = None
+    client_state["last_trigger_choice_id"] = None
     return True
 
 
@@ -630,6 +684,60 @@ def interactive_loop(conn: Connection) -> None:
             if send_declare_blockers(conn, blockers):
                 log(f"[client] sent DECLARE_BLOCKERS {blockers}")
         
+            continue
+
+        if normalized.startswith("activate"):
+            parts = command.strip().split()
+            if len(parts) < 3:
+                log("[client] usage: activate <source_id> <ability_index> [target1 target2 ...]")
+                continue
+            source_id = parts[1]
+            try:
+                ability_index = int(parts[2])
+            except ValueError:
+                log("[client] ability_index must be an integer")
+                continue
+            targets = parts[3:]
+            if send_activate_ability(conn, source_id, ability_index, targets):
+                log(f"[client] sent ACTIVATE_ABILITY {source_id} idx={ability_index} targets={targets}")
+            continue
+
+        if normalized.startswith("damageorder"):
+            parts = command.strip().split()
+            if len(parts) < 3:
+                log("[client] usage: damageorder <attacker_id> <blocker_id1> <blocker_id2> ...")
+                continue
+            attacker_id = parts[1]
+            blocker_order = parts[2:]
+            if send_assign_damage_order(conn, attacker_id, blocker_order):
+                log(f"[client] sent ASSIGN_DAMAGE_ORDER {attacker_id} order={blocker_order}")
+            continue
+
+        if normalized.startswith("order"):
+            parts = command.strip().split()
+            if len(parts) < 2:
+                log("[client] usage: order <trigger_id1> <trigger_id2> ...")
+                continue
+            ordered_ids = parts[1:]
+            if send_trigger_order_response(conn, ordered_ids):
+                log(f"[client] sent TRIGGER_ORDER_RESPONSE {ordered_ids}")
+            continue
+
+        if normalized.startswith("trigger"):
+            parts = command.strip().split()
+            if len(parts) < 2:
+                log("[client] usage: trigger accept [target] | trigger decline")
+                continue
+            action = parts[1].lower()
+            if action == "decline":
+                if send_trigger_choice_response(conn, accept=False):
+                    log("[client] sent TRIGGER_CHOICE_RESPONSE accept=False")
+            elif action == "accept":
+                target = parts[2] if len(parts) >= 3 else None
+                if send_trigger_choice_response(conn, accept=True, chosen_target=target):
+                    log(f"[client] sent TRIGGER_CHOICE_RESPONSE accept=True target={target}")
+            else:
+                log("[client] usage: trigger accept [target] | trigger decline")
             continue
 
         if normalized.startswith("discard"):
