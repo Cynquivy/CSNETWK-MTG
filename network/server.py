@@ -3,28 +3,19 @@ import random
 import socket
 import threading
 
-from model import land
 from network import protocol
-from network.protocol import Connection, ConnectionClosed, ProtocolError, log
+from network.protocol import Connection, ConnectionClosed, MalformedPDU, ProtocolError, log
 from network import pdu as pdu_builders
 
 from model.phase import Phase, TURN_SEQUENCE
 from model.player import player
 from model.creature import creature
-from model.artifact import artifact
-from model.enchantment import enchantment
 from model.instant import instant
-from model.sorcery import sorcery
 from model.card_database import card_database
 from model.stack import StackItem, StackItemType
 from model.mana import payment_covers_cost
 from model.triggers import TriggerEvent, trigger_definition_for
-# Aliased: this file also defines its own (dead, unreachable -- see
-# GameController below) in-file `class GameState`, later in this same
-# module. Since that class definition executes at module-load time, it
-# would silently overwrite an unaliased `GameState` import in this
-# module's namespace before any method ever ran.
-from model.game_state import GameState as ModelGameState
+from model.game_state import GameState
 from model.lifecycle import LifecycleState
 
 MAX_PLAYERS = 2
@@ -61,8 +52,6 @@ class GameServer:
         self.verbose = verbose
         self.clients = {}
         self.lock = threading.Lock()
-        # controls flow of game
-        self.session = GameSession()
 
         # RFC 0001 Section 4.2: the server's single authoritative Game
         # State (model/game_state.py, Milestone #3). Starts in LOBBY
@@ -71,7 +60,7 @@ class GameServer:
         # -- that only modeled 3 states (LOBBY/SETUP/IN_GAME) where the
         # RFC's own Section 6.1 lifecycle machine has 5 (LOBBY/GAME_SETUP/
         # MULLIGAN/IN_GAME/GAME_OVER).
-        self.game_state = ModelGameState()
+        self.game_state = GameState()
 
         # LOBBY-only bookkeeping (RFC 6.2), reset whenever the server
         # re-enters LOBBY (on startup, and after every GAME_OVER --
@@ -244,7 +233,17 @@ class GameServer:
     def _serve_client(self, label: str, conn: Connection) -> None:
         try:
             while True:
-                pdu = conn.recv_pdu()      # blocks until a full PDU arrives
+                try:
+                    pdu = conn.recv_pdu()      # blocks until a full PDU arrives
+                except MalformedPDU as exc:
+                    conn.send_pdu(pdu_builders.build_error(
+                        seq_num=conn.next_seq(),
+                        code="INVALID_JSON",
+                        message=str(exc),
+                        rejected_action=None,
+                    ))
+                    continue
+
                 handler = self._handlers.get(pdu["type"])
                 if handler is None:
                     # RFC 0001 Section 11 / 10.2.23: ERROR echoes the seq_num
@@ -1039,7 +1038,7 @@ class GameServer:
             ))
 
         with self.lock:
-            self.game_state = ModelGameState()          # creates a fresh state for the next match
+            self.game_state = GameState()          # creates a fresh state for the next match
             self.player_id_to_label.clear()
             self.pending_decks.clear()
             self.game_state.lifecycle_state = LifecycleState.LOBBY
@@ -2351,478 +2350,6 @@ class GameServer:
         })
 
 
-class GameSession:
-    def __init__(self):
-        self.controller = GameController()
-
-    def run(self):
-        while not self.controller.state.game_over:
-            phase = self.controller.state.phase
-
-            print(
-                f"\nTurn {self.controller.state.turn_number}"
-                f" | Phase: {phase.name}"
-            )
-
-            match phase:
-                case Phase.UNTAP:
-                    self.controller.do_untap()
-
-                case Phase.UPKEEP:
-                    self.controller.do_upkeep()
-
-                case Phase.DRAW:
-                    self.controller.do_draw()
-
-                case Phase.MAIN_ONE:
-                    self.controller.do_main_one()
-
-                case Phase.COMBAT_BEGINNING:
-                    self.controller.begin_combat()
-
-                case Phase.DECLARE_ATTACKERS:
-                    has_attackers = self.controller.declare_attackers()
-
-                    if not has_attackers:
-                        self.controller.state.phase = Phase.END_OF_COMBAT
-
-                case Phase.DECLARE_BLOCKERS:
-                    self.controller.declare_blockers()
-
-                case Phase.ASSIGN_DAMAGE_ORDER:
-                    self.controller.assign_damage_order()
-
-                case Phase.COMBAT_EXECUTE:
-                    self.controller.execute_combat()
-
-                case Phase.END_OF_COMBAT:
-                    self.controller.end_combat()
-
-                case Phase.MAIN_TWO:
-                    self.controller.do_main_two()
-
-                case Phase.END_STEP:
-                    self.controller.do_end_step()
-
-                case Phase.CLEANUP:
-                    self.controller.do_cleanup()
-
-                case _:
-                    raise ValueError(f"Unknown phase: {phase}")
-
-            if not self.controller.state.game_over:
-                if self.controller.state.phase == phase:
-                    self.controller.empty_mana_pools()
-                    self.controller.state.next_phase()
-
-class GameController:
-    def __init__(self):
-        self.state = GameState()
-        self.players = []
-        self.stack = []
-    
-    def do_untap(self):
-        active_player = self.players[self.state.AP_idx]
-
-        for card in active_player.board:
-            if card.is_tapped:
-                card.is_tapped = False
-    
-    def do_upkeep(self):
-        # no upkeep triggers
-        self.open_priority_window()
-    
-    def do_draw(self):
-        skip_first_draw = (
-            self.state.turn_number == 1
-            and self.state.AP_idx == self.state.starting_player_idx
-        )
-    
-        if not skip_first_draw:
-            draw_successful = self.players[self.state.AP_idx].draw_from_lib(1)
-    
-            if not draw_successful:
-                self.state.set_to_game_over()
-                return
-    
-        self.open_priority_window()
-    
-    def do_main_one(self):
-        self.open_priority_window()
-    
-    def begin_combat(self):
-        self.open_priority_window()
-    
-    def declare_attackers(self):
-        num_of_attackers = self.players[self.state.AP_idx].declare_attackers()
-    
-        if num_of_attackers == 0:
-            return False
-    
-        self.open_priority_window()
-        return True
-    
-    def declare_blockers(self):
-        self.players[self.state.NAP_idx].declare_blockers()
-    
-    def assign_damage_order(self):
-        active_player = self.players[self.state.AP_idx]
-    
-        for card in active_player.board:
-            if isinstance(card, creature):
-                if card.is_attacking:
-                    if len(card.blocked_by) == 1:
-                        card.damage_order = card.blocked_by.copy()
-    
-                    elif len(card.blocked_by) >= 2:
-                        card.damage_order = self.game_ui.get_damage_order(card, card.blocked_by)
-    
-        self.open_priority_window()
-    
-    def execute_combat(self):
-        active_player = self.players[self.state.AP_idx]
-        defending_player = self.players[self.state.NAP_idx]
-        damage_assignments = []
-    
-        for attacker in active_player.board:
-            if isinstance(attacker, creature) and attacker.is_attacking:
-                if not attacker.was_blocked:
-                    damage_assignments.append((defending_player, attacker.power))
-                else:
-                    damage_assignments.extend(self.assign_attacker_damage(attacker))
-    
-                for blocker in attacker.blocked_by:
-                    if blocker in defending_player.board:
-                        damage_assignments.append((attacker, blocker.power))
-    
-        for target, damage in damage_assignments:
-            if isinstance(target, player):
-                target.life -= damage
-            else:
-                target.damage_marked += damage
-    
-        self.check_state_based_actions()
-    
-        if not self.state.game_over:
-            self.open_priority_window()
-        
-    def end_combat(self):
-        self.open_priority_window()
-    
-        for current_player in self.players:
-            for card in current_player.board:
-                if isinstance(card, creature):
-                    card.is_attacking = False
-                    card.is_blocking = False
-                    card.was_blocked = False
-                    card.blocked_by.clear()
-                    card.damage_order.clear()
-    
-    def do_main_two(self):
-        self.open_priority_window()
-    
-    def do_end_step(self):
-        self.open_priority_window()
-    
-    def do_cleanup(self):
-        active_player = self.players[self.state.AP_idx]
-
-        while len(active_player.hand) > 7:
-            discarded_card = self.game_ui.get_card_selection(active_player.hand)
-    
-            active_player.hand.remove(discarded_card)
-            active_player.graveyard.append(discarded_card)
-    
-        for current_player in self.players:
-            for card in current_player.board:
-                if isinstance(card, creature):
-                    card.power = card.base_power
-                    card.toughness = card.base_toughness
-                    card.damage_marked = 0
-        
-        active_player.land_played_this_turn = False
-        
-        self.state.AP_idx, self.state.NAP_idx = (self.state.NAP_idx, self.state.AP_idx)
-    
-        self.state.turn_number += 1
-    
-    def open_priority_window(self):
-        prio = self.state.AP_idx
-        pass_ctr = 0
-            
-        while len(self.stack) != 0 or pass_ctr != 2:
-            
-            player = self.players[prio]
-            
-            if prio == self.state.AP_idx and len(self.stack) == 0 and self.state.phase in (Phase.PRECOMBAT_MAIN, Phase.POSTCOMBAT_MAIN):
-                action = self.game_ui.get_main_phase_action(player)
-            else:
-                action = self.game_ui.get_priority_action(player)
-            
-            if action == "play_land":
-                land = player.select_land()
-            
-                can_play_land = (
-                    len(self.stack) == 0
-                    and prio == self.state.AP_idx
-                    and self.state.phase in (Phase.PRECOMBAT_MAIN, Phase.POSTCOMBAT_MAIN)
-                    and land is not None
-                    and land in player.hand
-                    and not player.land_played_this_turn
-                )
-
-                if can_play_land:
-                    player.hand.remove(land)
-                    player.board.append(land)
-                    land.is_tapped = False
-                    player.land_played_this_turn = True
-                    pass_ctr = 0
-                else:
-                    print("Cannot play land.")
-            
-            elif action == "cast_creature":
-                creature = self.players[prio].select_creature()
-                
-                if creature is not None:
-                    if self.can_cast_creature(self.players[prio], creature):
-                        if self.pay_mana(self.players[prio], creature):
-                            self.players[prio].hand.remove(creature)
-                            self.stack.append(creature)
-            
-                            pass_ctr = 0
-            
-                            print(
-                                f"{self.players[prio].player_name} cast "
-                                f"{creature.card_name}."
-                            )
-                    else:
-                        print("You cannot cast that creature.")
-                
-            
-            elif action == "cast_spell":
-                spell = player.select_card_to_stack()
-            
-                if spell is not None and self.can_cast_spell(player, spell):
-                    if self.pay_mana(player, spell):
-                        player.hand.remove(spell)
-                        self.stack.append(spell)
-                        pass_ctr = 0
-                else:
-                    print("You cannot cast that spell.")
-            
-            elif action == "pass":
-                pass_ctr += 1
-            
-                if pass_ctr == 2:
-                    if len(self.stack) != 0:
-                        self.resolve_stack()
-                        pass_ctr = 0
-                        prio = self.state.AP_idx
-                    else:
-                        break
-                else:
-                    prio = (prio + 1) % 2
-    
-    def resolve_stack(self):
-        card = self.stack.pop()
-    
-        if isinstance(card, (creature, artifact, enchantment)):
-            owner = self.players[card.owner_player_idx]
-            owner.board.append(card)
-            card.is_tapped = False
-            card.effect()
-    
-        else:
-            card.effect()
-            owner = self.players[card.owner_player_idx]
-            owner.graveyard.append(card)
-    
-        self.check_state_based_actions()
-    
-    def assign_attacker_damage(self, attacker):
-        damage_assignments = []
-        remaining_damage = attacker.power
-    
-        defending_player = self.players[self.state.NAP_idx]
-    
-        for blocker in attacker.damage_order:
-            if remaining_damage > 0 and blocker in defending_player.board:
-                lethal_damage = max(0, blocker.toughness - blocker.damage_marked)
-                damage = min(remaining_damage, lethal_damage)
-    
-                if damage > 0:
-                    damage_assignments.append((blocker, damage))
-    
-                remaining_damage -= damage
-    
-        return damage_assignments
-    
-    def check_state_based_actions(self):
-        state_changed = True
-    
-        while state_changed and not self.state.game_over:
-            state_changed = False
-    
-            for current_player in self.players:
-                creatures_to_remove = []
-    
-                for card in current_player.board:
-                    if isinstance(card, creature):
-                        has_zero_toughness = card.toughness <= 0
-                        has_lethal_damage = card.damage_marked >= card.toughness
-    
-                        if has_zero_toughness or has_lethal_damage:
-                            creatures_to_remove.append(card)
-    
-                for card in creatures_to_remove:
-                    current_player.board.remove(card)
-                    current_player.graveyard.append(card)
-                    state_changed = True
-    
-            losing_players = []
-    
-            for index, current_player in enumerate(self.players):
-                if current_player.life <= 0:
-                    losing_players.append(index)
-    
-            if len(losing_players) > 0:
-                self.state.set_to_game_over()
-    
-    def can_cast_creature(self, player, card):
-        return (
-            player == self.players[self.state.AP_idx]
-            and self.state.phase in (Phase.PRECOMBAT_MAIN, Phase.POSTCOMBAT_MAIN)
-            and len(self.stack) == 0
-            and isinstance(card, creature)
-            and card in player.hand
-            and self.can_pay_mana(player, card)
-        )
-    
-    def can_pay_mana(self, player, card):
-        if player.white_mpool < card.white:
-            return False
-    
-        if player.blue_mpool < card.blue:
-            return False
-    
-        if player.black_mpool < card.black:
-            return False
-    
-        if player.red_mpool < card.red:
-            return False
-    
-        if player.green_mpool < card.green:
-            return False
-    
-        remaining_mana = (
-            player.white_mpool - card.white
-            + player.blue_mpool - card.blue
-            + player.black_mpool - card.black
-            + player.red_mpool - card.red
-            + player.green_mpool - card.green
-        )
-    
-        return remaining_mana >= card.generic
-    
-    def pay_mana(self, player, card):
-        if not self.can_pay_mana(player, card):
-            return False
-    
-        player.white_mpool -= card.white
-        player.blue_mpool -= card.blue
-        player.black_mpool -= card.black
-        player.red_mpool -= card.red
-        player.green_mpool -= card.green
-    
-        generic_remaining = card.generic
-    
-        mana_pools = [
-            "white_mpool",
-            "blue_mpool",
-            "black_mpool",
-            "red_mpool",
-            "green_mpool"
-        ]
-    
-        for mana_pool in mana_pools:
-            available = getattr(player, mana_pool)
-            mana_to_spend = min(available, generic_remaining)
-            setattr(player, mana_pool, available - mana_to_spend)
-            generic_remaining -= mana_to_spend
-    
-        return generic_remaining == 0
-    
-    def can_cast_spell(self, player, card):
-        if card not in player.hand:
-            return False
-    
-        if not self.can_pay_mana(player, card):
-            return False
-    
-        if isinstance(card, instant):
-            return True
-    
-        if isinstance(card, (sorcery, artifact, enchantment)):
-            return (
-                player == self.players[self.state.AP_idx]
-                and self.state.phase in (Phase.PRECOMBAT_MAIN, Phase.POSTCOMBAT_MAIN)
-                and len(self.stack) == 0
-            )
-    
-        return False
-    
-    def empty_mana_pools(self):
-        for player in self.players:
-            player.white_mpool = 0
-            player.blue_mpool = 0
-            player.black_mpool = 0
-            player.red_mpool = 0
-            player.green_mpool = 0
-    
-class GameState:
-    def __init__(self):
-        self.phase = Phase.UNTAP
-        self.game_start = True
-        self.game_over = False
-        self.AP_idx = 0
-        self.NAP_idx = 1
-        self.turn_number = 1
-        self.starting_player_idx = 0
-        
-    def next_phase(self):
-        match self.phase:
-            case Phase.UNTAP:
-                self.phase = Phase.UPKEEP
-            case Phase.UPKEEP:
-                self.phase = Phase.DRAW
-            case Phase.DRAW:
-                self.phase = Phase.PRECOMBAT_MAIN
-            case Phase.PRECOMBAT_MAIN:
-                self.phase = Phase.BEGIN_COMBAT
-            case Phase.BEGIN_COMBAT:
-                self.phase = Phase.DECLARE_ATTACKERS
-            case Phase.DECLARE_ATTACKERS:
-                self.phase = Phase.DECLARE_BLOCKERS
-            case Phase.DECLARE_BLOCKERS:
-                self.phase = Phase.ASSIGN_DAMAGE_ORDER
-            case Phase.ASSIGN_DAMAGE_ORDER:
-                self.phase = Phase.FIRST_STRIKE_DAMAGE
-            case Phase.FIRST_STRIKE_DAMAGE:
-                self.phase = Phase.COMBAT_DAMAGE
-            case Phase.COMBAT_DAMAGE:
-                self.phase = Phase.END_OF_COMBAT
-            case Phase.END_OF_COMBAT:
-                self.phase = Phase.POSTCOMBAT_MAIN
-            case Phase.POSTCOMBAT_MAIN:
-                self.phase = Phase.END_STEP
-            case Phase.END_STEP:
-                self.phase = Phase.CLEANUP
-            case Phase.CLEANUP:
-                self.phase = Phase.UNTAP
-        
-    def set_to_game_over(self):
-        self.game_over = True
-    
 def main() -> None:
     parser = argparse.ArgumentParser(description="MTGNP Game Server")
     parser.add_argument("--host", default="0.0.0.0",

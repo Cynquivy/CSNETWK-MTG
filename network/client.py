@@ -296,14 +296,14 @@ def send_priority_pass(conn: Connection) -> bool:
     return True
 
 
-def send_cast_spell(conn: Connection, card_id: str, targets: list) -> bool:
+def send_cast_spell(conn: Connection, card_id: str, targets: list, mana_payment: dict = None) -> bool:
     seq = client_state["last_priority_grant_seq"]
 
     if not client_state["has_priority"] or seq is None:
         log("[client] you do not currently have priority")
         return False
 
-    conn.send_pdu(pdu_builders.build_cast_spell(seq, card_id, list(targets), {}))
+    conn.send_pdu(pdu_builders.build_cast_spell(seq, card_id, list(targets), mana_payment or {}))
 
     return True
 
@@ -388,15 +388,27 @@ def send_declare_blockers(conn: Connection, blockers: list) -> bool:
     return True
 
 
-def send_activate_ability(conn: Connection, source_id: str, ability_index: int, targets: list) -> bool:
+def send_activate_ability(conn: Connection, source_id: str, ability_index: int, targets: list,
+                           tap: bool = False, mana: dict = None) -> bool:
     seq = client_state["last_priority_grant_seq"]
 
     if seq is None:
         log("[client] no PRIORITY_GRANT recorded -- cannot activate ability")
         return False
-    
-    conn.send_pdu(pdu_builders.build_activate_ability(seq, source_id, ability_index, targets))
+
+    conn.send_pdu(pdu_builders.build_activate_ability(
+        seq, source_id, ability_index, targets, tap, mana or {}))
     return True
+
+
+def parse_mana_spec(spec: str) -> dict | None:
+    mana = {}
+    for pair in spec.split(","):
+        if len(pair) < 2 or not pair[1:].isdigit():
+            return None
+        color = pair[0].upper()
+        mana[color] = mana.get(color, 0) + int(pair[1:])
+    return mana
 
 
 def send_assign_damage_order(conn: Connection, attacker_id: str, blocker_order: list) -> bool:
@@ -543,7 +555,7 @@ def render_in_game_cli(state: dict, my_id: str) -> None:
     log("-" * width)
     log(" Commands (in-game):")
     log("  pass                        -- send PRIORITY_PASS")
-    log("  cast <card_id> [targets...] -- cast a spell with optional targets")
+    log("  cast <card_id> [mana:R1,U2] [targets...] -- cast a spell, optionally paying mana and/or targeting")
     log("  playland <card_id>          -- play a land from your hand")
     log("  attack <creature_ids...>    -- declare attackers (space-separated)")
     log("  block <attacker:blocker ...>-- declare blockers as pairs attacker:blocker")
@@ -691,17 +703,32 @@ def interactive_loop(conn: Connection) -> None:
         
         if normalized.startswith("cast"):
             parts = command.strip().split()
-        
+
             if len(parts) < 2:
-                log("[client] usage: cast <card_id> [target1 target2 ...]")
+                log("[client] usage: cast <card_id> [mana:R1,U2] [target1 target2 ...]")
                 continue
-        
+
             card_id = parts[1]
-            targets = parts[2:]
-        
-            if send_cast_spell(conn, card_id, targets):
-                log(f"[client] sent CAST_SPELL {card_id} targets={targets}")
-        
+            mana_payment = {}
+            targets = []
+            bad_mana_spec = None
+            for token in parts[2:]:
+                if token.lower().startswith("mana:"):
+                    parsed = parse_mana_spec(token[len("mana:"):])
+                    if parsed is None:
+                        bad_mana_spec = token
+                        break
+                    mana_payment.update(parsed)
+                else:
+                    targets.append(token)
+
+            if bad_mana_spec is not None:
+                log(f"[client] invalid mana spec '{bad_mana_spec}', expected e.g. mana:R1,U2")
+                continue
+
+            if send_cast_spell(conn, card_id, targets, mana_payment):
+                log(f"[client] sent CAST_SPELL {card_id} mana_payment={mana_payment} targets={targets}")
+
             continue
         
         if normalized.startswith("playland"):
@@ -751,7 +778,7 @@ def interactive_loop(conn: Connection) -> None:
         if normalized.startswith("activate"):
             parts = command.strip().split()
             if len(parts) < 3:
-                log("[client] usage: activate <source_id> <ability_index> [target1 target2 ...]")
+                log("[client] usage: activate <source_id> <ability_index> [tap] [mana:R1,U2] [target1 target2 ...]")
                 continue
             source_id = parts[1]
             try:
@@ -759,9 +786,30 @@ def interactive_loop(conn: Connection) -> None:
             except ValueError:
                 log("[client] ability_index must be an integer")
                 continue
-            targets = parts[3:]
-            if send_activate_ability(conn, source_id, ability_index, targets):
-                log(f"[client] sent ACTIVATE_ABILITY {source_id} idx={ability_index} targets={targets}")
+
+            tap = False
+            mana = {}
+            targets = []
+            bad_mana_spec = None
+            for token in parts[3:]:
+                if token.lower() == "tap":
+                    tap = True
+                elif token.lower().startswith("mana:"):
+                    parsed = parse_mana_spec(token[len("mana:"):])
+                    if parsed is None:
+                        bad_mana_spec = token
+                        break
+                    mana.update(parsed)
+                else:
+                    targets.append(token)
+
+            if bad_mana_spec is not None:
+                log(f"[client] invalid mana spec '{bad_mana_spec}', expected e.g. mana:R1,U2")
+                continue
+
+            if send_activate_ability(conn, source_id, ability_index, targets, tap, mana):
+                log(f"[client] sent ACTIVATE_ABILITY {source_id} idx={ability_index} "
+                    f"tap={tap} mana={mana} targets={targets}")
             continue
 
         if normalized.startswith("damageorder"):
@@ -845,9 +893,9 @@ def interactive_loop(conn: Connection) -> None:
             log("  mulligan keep <ids>           keep and bottom the listed card ids")
             log("")
             log("  pass                          send PRIORITY_PASS")
-            log("  cast <card_id> [targets...]   cast a spell, optionally with targets")
+            log("  cast <card_id> [mana:R1,U2] [targets...]  cast a spell, optionally paying mana and/or targeting")
             log("  playland <card_id>            play a land from your hand")
-            log("  activate <src_id> <idx> [targets...]  activate a permanent's ability")
+            log("  activate <src_id> <idx> [tap] [mana:R1,U2] [targets...]  activate a permanent's ability")
             log("")
             log("  attack <ids...>               declare attackers (blank for none)")
             log("  block <atk_id>:<blk_id> ...   declare blockers as attacker:blocker pairs")
