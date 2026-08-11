@@ -68,6 +68,8 @@ def _handle_game_state_update(conn: Connection, pdu: dict) -> None:
     client_state["current_phase"] = phase
     client_state["active_player"] = state.get("active_player")
 
+    hand = state.get("hand", {}).get(client_state["player_id"], [])
+
     clear_prompt()
 
     if phase == "LOBBY":
@@ -80,6 +82,14 @@ def _handle_game_state_update(conn: Connection, pdu: dict) -> None:
         client_state["waiting_after_keep"] = keep_status.get(client_state["player_id"], False)
     
         render_mulligan_cli(state, client_state["player_id"])
+
+    elif phase == "CLEANUP":
+        my_id = client_state["player_id"]
+        if state.get("active_player") == my_id and len(hand) > 7:
+            excess = len(hand) - 7
+            log(f"[client] you must discard {excess} card(s): "
+                f"type 'discard <card_id1> <card_id2> ...'")
+            client_state["awaiting_action"] = "DISCARD"
 
     else:
         render_in_game_cli(state, client_state["player_id"])
@@ -377,6 +387,15 @@ def send_concede(conn: Connection) -> bool:
     return True
 
 
+def send_discard(conn: Connection, card_ids: list) -> bool:
+    seq = client_state["last_game_state_update_seq"]
+    if seq is None:
+        log("[client] no GAME_STATE_UPDATE recorded -- cannot discard")
+        return False
+    conn.send_pdu(pdu_builders.build_discard(seq, card_ids))
+    return True
+
+
 def render_in_game_cli(state: dict, my_id: str) -> None:
     width = 80
     turn = state.get("turn")
@@ -610,6 +629,13 @@ def interactive_loop(conn: Connection) -> None:
             if send_declare_blockers(conn, blockers):
                 log(f"[client] sent DECLARE_BLOCKERS {blockers}")
         
+            continue
+
+        if normalized.startswith("discard"):
+            parts = command.strip().split()
+            card_ids = parts[1:]
+            if send_discard(conn, card_ids):
+                log(f"[client] sent DISCARD {card_ids}")
             continue
         
         if normalized == "concede":
