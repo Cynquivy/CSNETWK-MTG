@@ -344,6 +344,8 @@ def send_declare_attackers(conn: Connection, attackers: list) -> bool:
         log("[client] only the active player may declare attackers")
         return False
 
+    # RFC 5.4 : The corresponding server request PDU is the PHASE_TRANSITION that signals 
+    # each respective step; the client MUST echo that PHASE_TRANSITION's seq_num.
     seq = client_state["last_phase_transition_seq"]
 
     if seq is None:
@@ -373,6 +375,8 @@ def send_declare_attackers(conn: Connection, attackers: list) -> bool:
 
 
 def send_declare_blockers(conn: Connection, blockers: list) -> bool:
+    # RFC 5.4 : The corresponding server request PDU is the PHASE_TRANSITION that signals 
+    # each respective step; the client MUST echo that PHASE_TRANSITION's seq_num.
     seq = client_state["last_phase_transition_seq"]
 
     if seq is None:
@@ -386,31 +390,41 @@ def send_declare_blockers(conn: Connection, blockers: list) -> bool:
 
 def send_activate_ability(conn: Connection, source_id: str, ability_index: int, targets: list) -> bool:
     seq = client_state["last_priority_grant_seq"]
+
     if seq is None:
         log("[client] no PRIORITY_GRANT recorded -- cannot activate ability")
         return False
+    
     conn.send_pdu(pdu_builders.build_activate_ability(seq, source_id, ability_index, targets))
     return True
 
 
 def send_assign_damage_order(conn: Connection, attacker_id: str, blocker_order: list) -> bool:
     seq = client_state["last_phase_transition_seq"]
+
     if seq is None:
         log("[client] no PHASE_TRANSITION recorded -- cannot assign damage order")
         return False
+    
     conn.send_pdu(pdu_builders.build_assign_damage_order(seq, attacker_id, blocker_order))
     return True
 
 
 def send_trigger_order_response(conn: Connection, ordered_trigger_ids: list) -> bool:
+    # RFC 5.4 : The corresponding server request PDU is the PHASE_TRANSITION that signals 
+    # each respective step; the client MUST echo that PHASE_TRANSITION's seq_num.
     seq = client_state["last_trigger_order_seq"]
+
     if seq is None:
         log("[client] no TRIGGER_ORDER recorded -- cannot respond")
         return False
+    
     expected = client_state["last_trigger_order_ids"]
+
     if expected is not None and set(ordered_trigger_ids) != set(expected):
         log(f"[client] ordered_trigger_ids must contain exactly {expected}")
         return False
+    
     conn.send_pdu(pdu_builders.build_trigger_order_response(seq, ordered_trigger_ids))
     client_state["last_trigger_order_seq"] = None
     client_state["last_trigger_order_ids"] = None
@@ -419,9 +433,11 @@ def send_trigger_order_response(conn: Connection, ordered_trigger_ids: list) -> 
 
 def send_trigger_choice_response(conn: Connection, accept: bool, chosen_target: str = None) -> bool:
     seq = client_state["last_trigger_choice_seq"]
+
     if seq is None:
         log("[client] no TRIGGER_CHOICE recorded -- cannot respond")
         return False
+    
     trigger_id = client_state["last_trigger_choice_id"]
     conn.send_pdu(pdu_builders.build_trigger_choice_response(seq, trigger_id, accept, chosen_target))
     client_state["last_trigger_choice_seq"] = None
