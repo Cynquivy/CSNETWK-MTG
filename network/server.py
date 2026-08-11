@@ -5,7 +5,7 @@ import threading
 
 from model import land
 from network import protocol
-from network.protocol import Connection, ConnectionClosed, ProtocolError, log
+from network.protocol import Connection, ConnectionClosed, MalformedPDU, ProtocolError, log
 from network import pdu as pdu_builders
 
 from model.phase import Phase, TURN_SEQUENCE
@@ -244,7 +244,17 @@ class GameServer:
     def _serve_client(self, label: str, conn: Connection) -> None:
         try:
             while True:
-                pdu = conn.recv_pdu()      # blocks until a full PDU arrives
+                try:
+                    pdu = conn.recv_pdu()      # blocks until a full PDU arrives
+                except MalformedPDU as exc:
+                    conn.send_pdu(pdu_builders.build_error(
+                        seq_num=conn.next_seq(),
+                        code="INVALID_JSON",
+                        message=str(exc),
+                        rejected_action=None,
+                    ))
+                    continue
+
                 handler = self._handlers.get(pdu["type"])
                 if handler is None:
                     # RFC 0001 Section 11 / 10.2.23: ERROR echoes the seq_num
