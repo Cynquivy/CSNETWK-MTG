@@ -30,6 +30,12 @@ from model.lifecycle import LifecycleState
 MAX_PLAYERS = 2
 # RFC 4.2 / 10.2.5: the time_limit_ms advertised in every PRIORITY_GRANT.
 PRIORITY_TIME_LIMIT_MS = 60000
+# RFC 6.1 ("Any state MUST transition immediately to GAME_OVER if a player
+# disconnects and fails to reconnect within the implementation-defined
+# timeout") / 6.6: the RFC leaves the actual duration up to the
+# implementation. 30s matches the RFC 4.3 RECOMMENDED client PING interval,
+# so a client that is merely between heartbeats is never mistaken for gone.
+RECONNECT_TIMEOUT_S = 30
 
 
 class _PendingTrigger:
@@ -119,6 +125,14 @@ class GameServer:
         self._priority_timer = None
         self._priority_epoch = 0
 
+        # RFC 6.1/6.6: a seat whose TCP connection just died mid-match
+        # (GAME_SETUP/MULLIGAN/IN_GAME) is not freed immediately -- it
+        # stays reserved (still counts toward MAX_PLAYERS, still keeps its
+        # player_id_to_label/game_state.players entries) for up to
+        # RECONNECT_TIMEOUT_S, so the same player can resume on a new TCP
+        # connection. label -> (threading.Timer, player_id).
+        self._awaiting_reconnect = {}
+
         # handler table to call the corresponding method of each pdu type
         self._handlers = {
             "PLAYER_READY" : self._handle_player_ready,
@@ -163,29 +177,58 @@ class GameServer:
 
     def _on_accept(self, conn_sock: socket.socket, addr) -> None:
         with self.lock:
-            if len(self.clients) >= MAX_PLAYERS: 
+            reconnect_label = next(iter(self._awaiting_reconnect), None)
+
+            if reconnect_label is None and len(self.clients) >= MAX_PLAYERS:
                 # Refuse >2 players
                 log(f"[server] refusing extra connection from "
                     f"{addr[0]}:{addr[1]} (already {MAX_PLAYERS} players)")
                 conn_sock.close()
                 return
-            
-            label = self._next_free_label()
+
+            if reconnect_label is not None:
+                # RFC 6.1: a seat is in its reconnect grace period -- the
+                # next incoming connection resumes it rather than taking a
+                # fresh seat (there's no separate reconnect PDU defined;
+                # the new TCP connection itself IS the reconnect signal).
+                label = reconnect_label
+                timer, reconnected_player_id = self._awaiting_reconnect.pop(label)
+                timer.cancel()
+            else:
+                label = self._next_free_label()
+                reconnected_player_id = None
+
             conn = Connection(conn_sock, local="SERVER", peer=label,
                               verbose=self.verbose)
+            if reconnected_player_id is not None:
+                conn.player_id = reconnected_player_id
             self.clients[label] = conn
             seated = len(self.clients)
 
-        log(f"[server] {label} connected from {addr[0]}:{addr[1]} "
-            f"({seated}/{MAX_PLAYERS} players)")
-        
+        if reconnected_player_id is not None:
+            log(f"[server] {label} reconnected from {addr[0]}:{addr[1]} "
+                f"as '{reconnected_player_id}' (RFC 6.1)")
+        else:
+            log(f"[server] {label} connected from {addr[0]}:{addr[1]} "
+                f"({seated}/{MAX_PLAYERS} players)")
+
         threading.Thread(target=self._serve_client, args=(label, conn),
                          daemon=True).start()
-        
-        if self.game_state.lifecycle_state == LifecycleState.LOBBY:
+
+        if reconnected_player_id is not None:
+            # RFC 4.3: clients accept GAME_STATE_UPDATE as authoritative --
+            # a personalized resync is all a reconnecting client needs to
+            # catch back up; build_game_state_update_in_game degrades
+            # gracefully for MULLIGAN/GAME_SETUP too (see its docstring).
+            conn.send_pdu(pdu_builders.build_game_state_update_in_game(
+                seq_num=conn.next_seq(),
+                game_state=self.game_state,
+                viewer_player_id=reconnected_player_id,
+            ))
+        elif self.game_state.lifecycle_state == LifecycleState.LOBBY:
             ready_labels = set(self.player_id_to_label.values())
             waiting_for = [l for l in self.clients if l not in ready_labels]
-        
+
             conn.send_pdu(pdu_builders.build_game_state_update_lobby(
                 seq_num=conn.next_seq(),
                 players_ready=len(self.pending_decks),
@@ -227,10 +270,61 @@ class GameServer:
 
         finally:
             conn.close()
-            with self.lock:
+            self._handle_disconnect(label, conn)
+
+    def _handle_disconnect(self, label: str, conn: Connection) -> None:
+        """
+        RFC 6.1: "Any state MUST transition immediately to GAME_OVER if a
+        player disconnects and fails to reconnect within the
+        implementation-defined timeout." Outside of an actual match
+        (LOBBY, including the post-GAME_OVER waiting state -- RFC 6.6 "the
+        server MAY close that connection and re-enter a waiting state"),
+        there is no match to protect, so the seat is simply freed, exactly
+        as before. Mid-match (GAME_SETUP/MULLIGAN/IN_GAME), the seat stays
+        reserved for RECONNECT_TIMEOUT_S so the same player can resume.
+        """
+        with self.lock:
+            # A stale thread for a connection this label no longer owns
+            # (superseded by a reconnect, or already cleaned up by a prior
+            # disconnect/timeout/GAME_OVER) has nothing left to do.
+            if self.clients.get(label) is not conn:
+                return
+
+            player_id = getattr(conn, "player_id", None)
+            mid_match = (
+                self.game_state.lifecycle_state != LifecycleState.LOBBY
+                and player_id in self.player_id_to_label
+            )
+
+            if not mid_match:
                 self.clients.pop(label, None)
                 remaining = len(self.clients)
-            log(f"[server] {label} slot freed ({remaining}/{MAX_PLAYERS} players)")
+                log(f"[server] {label} slot freed ({remaining}/{MAX_PLAYERS} players)")
+                return
+
+            log(f"[server] {label} ('{player_id}') disconnected mid-match -- "
+                f"opening a {RECONNECT_TIMEOUT_S}s reconnect window (RFC 6.1)")
+            timer = threading.Timer(RECONNECT_TIMEOUT_S, self._on_reconnect_timeout,
+                                     args=(label, player_id))
+            timer.daemon = True
+            self._awaiting_reconnect[label] = (timer, player_id)
+            timer.start()
+
+    def _on_reconnect_timeout(self, label: str, player_id: str) -> None:
+        with self.lock:
+            entry = self._awaiting_reconnect.get(label)
+            still_awaiting = entry is not None and entry[1] == player_id
+            if still_awaiting:
+                del self._awaiting_reconnect[label]
+                self.clients.pop(label, None)
+            winner = self.game_state.opponent_of(player_id) if still_awaiting else None
+
+        if winner is None:
+            return
+
+        log(f"[server] {label} ('{player_id}') failed to reconnect within "
+            f"{RECONNECT_TIMEOUT_S}s -- treating as DISCONNECT (RFC 6.1)")
+        self._end_game(winner_id=winner.player_id, loser_id=player_id, reason="DISCONNECT")
 
     ### HANDLERS ###
     def _handle_player_ready(self, label: str, conn: Connection, pdu: dict) -> None:
@@ -927,11 +1021,17 @@ class GameServer:
         self._cancel_priority_timeout()
 
         with self.lock:
-            recipients = [self.clients[self.player_id_to_label[pid]]
-                          for pid in self.game_state.players]
+            # .get() rather than direct indexing: a DISCONNECT reason means
+            # the loser's own connection may already be gone (their seat
+            # was freed when their reconnect grace period expired, see
+            # _on_reconnect_timeout) -- there is nobody there to notify,
+            # but the surviving player still MUST hear about it.
+            recipients = [conn for pid in self.game_state.players
+                          if (recv_label := self.player_id_to_label.get(pid)) is not None
+                          and (conn := self.clients.get(recv_label)) is not None]
 
         for conn in recipients:
-            conn.send_pdu(pdu_builders.build_game_over(
+            self._safe_send(conn, pdu_builders.build_game_over(
                 seq_num=conn.next_seq(),
                 winner_id=winner_id,
                 loser_id=loser_id,
@@ -949,7 +1049,7 @@ class GameServer:
         # state and await new PLAYER_READY PDUs on the same TCP connections, allowing
         # the same two players to start a new game without reconnecting.
         for conn in recipients:
-            conn.send_pdu(pdu_builders.build_game_state_update_lobby(
+            self._safe_send(conn, pdu_builders.build_game_state_update_lobby(
                 seq_num=conn.next_seq(),
                 players_ready=0,
                 waiting_for=list(self.clients.keys()),
@@ -957,6 +1057,18 @@ class GameServer:
 
         log(f"[server] GAME_OVER ({reason}): winner={winner_id} loser={loser_id} "
             f"-- returned to LOBBY state")
+
+    @staticmethod
+    def _safe_send(conn: Connection, pdu: dict) -> None:
+        """Best-effort send for notification paths (GAME_OVER, the LOBBY
+        reset that follows it) that must not let one dead connection abort
+        cleanup for the other player -- e.g. both players disconnecting
+        near-simultaneously, or the DISCONNECT loser's own socket already
+        being gone by the time their reconnect grace period expires."""
+        try:
+            conn.send_pdu(pdu)
+        except OSError as exc:
+            log(f"[server] {conn.peer} send failed during GAME_OVER cleanup: {exc}")
 
     def _check_state_based_actions(self) -> tuple[str, str] | None:
         """
