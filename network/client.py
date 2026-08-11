@@ -391,8 +391,20 @@ def render_in_game_cli(state: dict, my_id: str) -> None:
     log("=" * width)
     log(f" Turn {turn}  |  Phase: {phase}  |  Active: {active}")
     log(f" Life totals: {life}")
-    log(f" Your hand ({len(hand)}): {', '.join(hand)}")
-    log(f" Battlefield: {battlefield}")
+    log(f" Your hand ({len(hand)}):")
+    log("   " + ", ".join(hand) if hand else "   (empty)")
+    log("")
+
+    log(" Battlefield:")
+    for side, permanents in battlefield.items():
+        if not permanents:
+            log(f"   {side}: (empty)")
+            continue
+        perm_str = ", ".join(
+            f"{p['id']} ({'tapped' if p['tapped'] else 'untapped'})"
+            for p in permanents
+        )
+        log(f"   {side}: {perm_str}")
     log("-" * width)
     log(" Commands (in-game):")
     log("  pass                       -- send PRIORITY_PASS")
