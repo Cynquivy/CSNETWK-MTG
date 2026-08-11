@@ -8,6 +8,7 @@ import random
 from network import protocol
 from network.protocol import (Connection, ConnectionClosed, ProtocolError, log)
 from model.card_database import card_database
+from model.mana import mana_output_of
 from network import pdu as pdu_builders
 
 seq_num = 1
@@ -37,6 +38,10 @@ client_state = {
 prompt_visible = False
 prompt_timer = None
 console_lock = threading.Lock()
+
+PING_INTERVAL_S = 30
+PONG_TIMEOUT_S = 10
+pong_event = threading.Event()
 
 def show_prompt() -> None:
     global prompt_visible
@@ -280,6 +285,7 @@ def _handle_pong(conn: Connection, pdu: dict) -> None:
     now = int(time.time() * 1000)
     rtt = now - pdu["timestamp"]
 
+    pong_event.set()
     log(f"[client] PONG received (seq_num={pdu['seq_num']}), rtt={rtt}ms")
 
 
@@ -313,31 +319,12 @@ def build_implicit_mana_payment(card_id: str) -> dict | None:
     my_id = client_state.get("player_id")
     battlefield = state.get("battlefield", {}).get(my_id, [])
 
-    available = {
-        "W": [],
-        "U": [],
-        "B": [],
-        "R": [],
-        "G": []
-    }
-
-    for permanent in battlefield:
-        if permanent.get("tapped"):
-            continue
-
-        permanent_id = permanent.get("id")
-        permanent_card = card_database.CARD_DATABASE.get(permanent_id)
-
-        if permanent_card is None:
-            continue
-
-        if getattr(permanent_card, "card_type", None) != "Land":
-            continue
-
-        color = getattr(permanent_card, "color", None)
-
-        if color in available:
-            available[color].append(permanent_id)
+    available = [
+        mana_output_of(permanent.get("id"))
+        for permanent in battlefield
+        if not permanent.get("tapped")
+    ]
+    available = [output for output in available if output]
 
     required = {
         "W": card.mana_white,
@@ -357,32 +344,35 @@ def build_implicit_mana_payment(card_id: str) -> dict | None:
 
     used = set()
 
-    # First satisfy colored requirements.
     for color in ["W", "U", "B", "R", "G"]:
-        if len(available[color]) < required[color]:
-            return None
+        for _ in range(required[color]):
+            index = next(
+                (i for i, output in enumerate(available)
+                 if i not in used and output.get(color, 0) > 0),
+                None
+            )
 
-        for land_id in available[color][:required[color]]:
-            used.add(land_id)
+            if index is None:
+                return None
+
+            used.add(index)
             payment[color] += 1
 
-    # Then pay generic mana using any remaining untapped lands.
     generic_remaining = card.mana_generic
 
-    for color in ["W", "U", "B", "R", "G"]:
-        for land_id in available[color]:
-            if generic_remaining == 0:
-                break
-
-            if land_id in used:
-                continue
-
-            used.add(land_id)
-            payment[color] += 1
-            generic_remaining -= 1
-
-        if generic_remaining == 0:
+    for index, output in enumerate(available):
+        if generic_remaining <= 0:
             break
+
+        if index in used:
+            continue
+
+        used.add(index)
+
+        for color, amount in output.items():
+            payment[color] = payment.get(color, 0) + amount
+
+        generic_remaining -= sum(output.values())
 
     if generic_remaining > 0:
         return None
@@ -643,33 +633,25 @@ def render_in_game_cli(state: dict, my_id: str) -> None:
         "U": 0,
         "B": 0,
         "R": 0,
-        "G": 0
+        "G": 0,
+        "X": 0
     }
-    
+
     my_battlefield = battlefield.get(my_id, []) if my_id else []
-    
+
     for permanent in my_battlefield:
         if permanent.get("tapped", False):
             continue
-    
-        card_id = permanent.get("id")
-        card = card_database.CARD_DATABASE.get(card_id)
-    
-        if card is None:
-            continue
-    
-        if getattr(card, "card_type", None) != "Land":
-            continue
-    
-        color = getattr(card, "color", None)
-    
-        if color in available_mana:
-            available_mana[color] += 1
-    
+
+        output = mana_output_of(permanent.get("id"))
+
+        for color, amount in output.items():
+            available_mana[color] = available_mana.get(color, 0) + amount
+
     log(f" Life totals: {life}")
     log(" Available Mana:")
-    log("   [W, U, B, R, G]")
-    log("   [" + ", ".join(str(available_mana[color]) for color in ["W", "U", "B", "R", "G"]) + "]")
+    log("   [W, U, B, R, G, X]")
+    log("   [" + ", ".join(str(available_mana[color]) for color in ["W", "U", "B", "R", "G", "X"]) + "]")
     log("")
     
     log(f" Your hand ({len(hand)}):")
@@ -709,6 +691,34 @@ def _build_sample_deck(limit: int = 50) -> list:
     if len(deck_ids) < limit:
         limit = len(deck_ids)
     return deck_ids[:limit]
+
+
+def heartbeat_loop(conn: Connection, stop_event: threading.Event) -> None:
+    seq = 1
+
+    while not stop_event.wait(PING_INTERVAL_S):
+        pong_event.clear()
+
+        try:
+            conn.send_pdu({"type": "PING", "seq_num": seq,
+                            "timestamp": int(time.time() * 1000)})
+        except OSError:
+            return
+
+        seq += 1
+
+        if pong_event.wait(PONG_TIMEOUT_S):
+            continue
+
+        if stop_event.is_set():
+            return
+
+        clear_prompt()
+        log(f"[client] no PONG received within {PONG_TIMEOUT_S}s -- disconnecting")
+        schedule_prompt()
+        stop_event.set()
+        conn.close()
+        return
 
 
 def receive_loop(conn: Connection, stop_event: threading.Event) -> None:
@@ -1109,9 +1119,11 @@ def main() -> None:
     conn = Connection(sock, local="CLIENT", peer="SERVER", verbose=args.verbose)
     stop_event = threading.Event()
     receiver = threading.Thread(target=receive_loop, args=(conn, stop_event), daemon=True)
+    heartbeat = threading.Thread(target=heartbeat_loop, args=(conn, stop_event), daemon=True)
 
     render_welcome_cli(args.host, args.port)
     receiver.start()
+    heartbeat.start()
     try:
         interactive_loop(conn)
     except ConnectionClosed:
@@ -1124,6 +1136,7 @@ def main() -> None:
         stop_event.set()
         conn.close()
         receiver.join(timeout=1.0)
+        heartbeat.join(timeout=1.0)
         log("[client] disconnected")
 
 
