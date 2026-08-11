@@ -11,7 +11,10 @@ class creature(card):
         self.will_block = False
         self.is_tappable = False
         self.is_tapped = False
-        self.has_haste = False
+        self.has_haste = (
+            card_id.startswith("monastery_swiftspear_")
+            or card_id.startswith("goblin_guide_")
+        )
         self.is_flying = False
         self.did_kick = False
         self.has_madness = False

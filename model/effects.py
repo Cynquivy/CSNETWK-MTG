@@ -59,6 +59,20 @@ def _destroy(game_state, targets, allowed_types=(creature,)):
         changes.append({"change_type": "DESTROY", "target": target_id})
     return changes
 
+def _sacrifice(game_state, source_id):
+    owner, permanent = _find_permanent(game_state, source_id)
+
+    if permanent is None:
+        return []
+
+    owner.board.remove(permanent)
+    owner.graveyard.append(permanent.card_id)
+
+    return [{
+        "change_type": "SACRIFICE",
+        "target": source_id
+    }]
+
 
 def _exile(game_state, targets, gain_life_equal_to_power=False):
     changes = []
@@ -78,12 +92,27 @@ def _exile(game_state, targets, gain_life_equal_to_power=False):
 
 def _counter_spell(game_state, targets):
     changes = []
+
     for target_id in targets:
         for index, stack_item in enumerate(game_state.stack):
-            if stack_item.stack_item_id == target_id:
-                del game_state.stack[index]
-                changes.append({"change_type": "COUNTER", "target": target_id})
-                break
+            if stack_item.stack_item_id != target_id:
+                continue
+
+            game_state.stack.pop(index)
+
+            controller = game_state.players.get(stack_item.controller_id)
+
+            if controller is not None:
+                controller.graveyard.append(stack_item.source_id)
+
+            changes.append({
+                "change_type": "COUNTER",
+                "target": target_id,
+                "card_id": stack_item.source_id
+            })
+
+            break
+
     return changes
 
 
@@ -152,7 +181,7 @@ def _prowess(game_state, source_id, controller_id, targets):
 
 
 def _sacrifice_self(game_state, source_id, controller_id, targets):
-    return _destroy(game_state, [source_id])
+    return _sacrifice(game_state, source_id)
 
 
 def _devotion_drain(game_state, source_id, controller_id, targets, color):

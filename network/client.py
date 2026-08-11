@@ -273,6 +273,12 @@ def _handle_priority_grant(conn: Connection, pdu: dict) -> None:
         client_state["has_priority"] = False
         client_state["last_priority_grant_seq"] = None
 
+    if client_state.get("last_game_state") is not None:
+        state = client_state["last_game_state"].get("state")
+
+        if state is not None:
+            state["priority_holder"] = player_id
+
 def _handle_stack_push(conn: Connection, pdu: dict) -> None:
     log(f"[client] STACK_PUSH: {pdu}")
 
@@ -427,8 +433,7 @@ def send_cast_spell(conn: Connection, card_id: str, targets: list) -> bool:
     mana_payment = build_implicit_mana_payment(card_id)
 
     if mana_payment is None:
-        log("[client] not enough available mana sources")
-        return False
+        mana_payment = {}
 
     conn.send_pdu(
         pdu_builders.build_cast_spell(
@@ -488,17 +493,22 @@ def send_declare_attackers(conn: Connection, attackers: list) -> bool:
 
     state = client_state["last_game_state"].get("state", {})
     battlefield = state.get("battlefield", {}).get(client_state["player_id"], [])
-
-    # Each declared attacker must be a creature currently on this player's battlefield.
+    
+    battlefield_ids = {
+        permanent.get("id")
+        for permanent in battlefield
+        if isinstance(permanent, dict)
+    }
+    
     for attacker in attackers:
         card_id = attacker["creature_id"]
-
-        if card_id not in battlefield:
+    
+        if card_id not in battlefield_ids:
             log(f"[client] '{card_id}' is not on your battlefield")
             return False
-
+    
         card = card_database.CARD_DATABASE.get(card_id)
-
+    
         if card is None or getattr(card, "card_type", None) != "Creature":
             log(f"[client] '{card_id}' is not a creature")
             return False
@@ -648,6 +658,11 @@ def format_permanent(permanent: dict) -> str:
     if card is not None and getattr(card, "card_type", None) == "Creature":
         power = permanent.get("power", getattr(card, "power", "?"))
         toughness = permanent.get("toughness", getattr(card, "toughness", "?"))
+        damage = permanent.get("damage", 0)
+
+        if damage > 0:
+            return f"{card_id} ({power}/{toughness}, dmg={damage})"
+
         return f"{card_id} ({power}/{toughness})"
 
     return card_id
@@ -703,7 +718,7 @@ def render_in_game_cli(state: dict, my_id: str) -> None:
             log(f"   {side}: (empty)")
             continue
         perm_str = ", ".join(
-            f"{format_permanent(p)} [{'T' if p['tapped'] else 'U'}]"
+            f"{format_permanent(p)} [{'T' if p['tapped'] else 'UT'}]"
             for p in permanents
         )
         log(f"   {side}: {perm_str}")
@@ -943,21 +958,38 @@ def interactive_loop(conn: Connection) -> None:
         if normalized.startswith("attack"):
             parts = command.strip().split()
         
-            # An empty attacker list means the Active Player declares no attackers.
-            attackers = [{"creature_id": cid, "target": None} for cid in parts[1:]]
+            state = client_state["last_game_state"].get("state", {})
+            players = list(state.get("life_totals", {}).keys())
+            my_id = client_state["player_id"]
+        
+            opponent_id = next(
+                (player_id for player_id in players if player_id != my_id),
+                None
+            )
+        
+            attackers = [
+                {
+                    "creature_id": cid,
+                    "target": opponent_id
+                }
+                for cid in parts[1:]
+            ]
         
             if send_declare_attackers(conn, attackers):
                 log(f"[client] sent DECLARE_ATTACKERS {attackers}")
         
             continue
         
-        if normalized.startswith("block"):
+        if normalized == "block":
+            blockers = []
+        
+            if send_declare_blockers(conn, blockers):
+                log("[client] sent DECLARE_BLOCKERS []")
+        
+            continue
+        
+        if normalized.startswith("block "):
             parts = command.strip().split()
-        
-            if len(parts) < 2:
-                log("[client] usage: block attacker:blocker [more pairs...]")
-                continue
-        
             blockers = []
         
             for pair in parts[1:]:
@@ -966,7 +998,11 @@ def interactive_loop(conn: Connection) -> None:
                     continue
         
                 atk, blk = pair.split(":", 1)
-                blockers.append({"creature_id": atk, "blocking_id": blk})
+        
+                blockers.append({
+                    "creature_id": blk,
+                    "blocking_id": atk
+                })
         
             if send_declare_blockers(conn, blockers):
                 log(f"[client] sent DECLARE_BLOCKERS {blockers}")

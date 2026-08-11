@@ -850,7 +850,6 @@ class GameServer:
                     c.blocked_by = []
                     c.damage_order = []
                     c.was_blocked = False
-                    c.damage_marked = 0
 
     def _run_phase_entry(self, phase) -> None:
         if phase is Phase.UNTAP:
@@ -875,23 +874,31 @@ class GameServer:
         # appropriate player to send the declaration.
 
     def _run_untap_step(self) -> None:
-        """RFC 7.2: untap the Active Player's permanents, reset their land
-        drop, broadcast the result, then move on with no priority window."""
+        """RFC 7.2: untap the Active Player's permanents, clear summoning
+        sickness, reset their land drop, broadcast the result, then move on."""
         with self.lock:
             active = self.game_state.active_player
+    
             for permanent in active.board:
                 permanent.is_tapped = False
+    
+                if isinstance(permanent, creature):
+                    permanent.summoning_sick = False
+    
             active.land_played_this_turn = False
-            recipients = [(pid, self.clients[self.player_id_to_label[pid]])
-                          for pid in self.game_state.players]
-
+    
+            recipients = [
+                (pid, self.clients[self.player_id_to_label[pid]])
+                for pid in self.game_state.players
+            ]
+    
         for player_id, conn in recipients:
             conn.send_pdu(pdu_builders.build_game_state_update_in_game(
                 seq_num=conn.next_seq(),
                 game_state=self.game_state,
                 viewer_player_id=player_id,
             ))
-
+    
         self._advance_phase()
 
     def _run_draw_step(self) -> None:
@@ -1292,6 +1299,25 @@ class GameServer:
                             self.game_state, item.source_id, item.controller_id, item.targets))
 
         result = "RESOLVED" if legal else "FIZZLE"
+
+        # Instants and Sorceries go to their controller's graveyard
+        # after resolving OR fizzling.
+        if item.item_type == StackItemType.SPELL:
+            spell_card = card_database.CARD_DATABASE.get(item.source_id)
+
+            if spell_card is not None and spell_card.card_type in ("Instant", "Sorcery"):
+                controller = self.game_state.players.get(item.controller_id)
+
+                if controller is not None:
+                    with self.lock:
+                        if item.source_id not in controller.graveyard:
+                            controller.graveyard.append(item.source_id)
+
+                    state_changes.append({
+                        "change_type": "GRAVEYARD_ADD",
+                        "target": item.controller_id,
+                        "card_id": item.source_id
+                    })
 
         with self.lock:
             recipients = [self.clients[self.player_id_to_label[pid]]
