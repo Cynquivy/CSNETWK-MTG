@@ -1171,6 +1171,9 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=None,
                         help="deterministic deck seed")
     args = parser.parse_args()
+    
+    global client_seed
+    client_seed = args.seed
 
     global client_seed
     client_seed = args.seed
