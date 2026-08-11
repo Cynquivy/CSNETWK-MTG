@@ -388,15 +388,27 @@ def send_declare_blockers(conn: Connection, blockers: list) -> bool:
     return True
 
 
-def send_activate_ability(conn: Connection, source_id: str, ability_index: int, targets: list) -> bool:
+def send_activate_ability(conn: Connection, source_id: str, ability_index: int, targets: list,
+                           tap: bool = False, mana: dict = None) -> bool:
     seq = client_state["last_priority_grant_seq"]
 
     if seq is None:
         log("[client] no PRIORITY_GRANT recorded -- cannot activate ability")
         return False
-    
-    conn.send_pdu(pdu_builders.build_activate_ability(seq, source_id, ability_index, targets))
+
+    conn.send_pdu(pdu_builders.build_activate_ability(
+        seq, source_id, ability_index, targets, tap, mana or {}))
     return True
+
+
+def parse_mana_spec(spec: str) -> dict | None:
+    mana = {}
+    for pair in spec.split(","):
+        if len(pair) < 2 or not pair[1:].isdigit():
+            return None
+        color = pair[0].upper()
+        mana[color] = mana.get(color, 0) + int(pair[1:])
+    return mana
 
 
 def send_assign_damage_order(conn: Connection, attacker_id: str, blocker_order: list) -> bool:
@@ -705,7 +717,7 @@ def interactive_loop(conn: Connection) -> None:
         if normalized.startswith("activate"):
             parts = command.strip().split()
             if len(parts) < 3:
-                log("[client] usage: activate <source_id> <ability_index> [target1 target2 ...]")
+                log("[client] usage: activate <source_id> <ability_index> [tap] [mana:R1,U2] [target1 target2 ...]")
                 continue
             source_id = parts[1]
             try:
@@ -713,9 +725,30 @@ def interactive_loop(conn: Connection) -> None:
             except ValueError:
                 log("[client] ability_index must be an integer")
                 continue
-            targets = parts[3:]
-            if send_activate_ability(conn, source_id, ability_index, targets):
-                log(f"[client] sent ACTIVATE_ABILITY {source_id} idx={ability_index} targets={targets}")
+
+            tap = False
+            mana = {}
+            targets = []
+            bad_mana_spec = None
+            for token in parts[3:]:
+                if token.lower() == "tap":
+                    tap = True
+                elif token.lower().startswith("mana:"):
+                    parsed = parse_mana_spec(token[len("mana:"):])
+                    if parsed is None:
+                        bad_mana_spec = token
+                        break
+                    mana.update(parsed)
+                else:
+                    targets.append(token)
+
+            if bad_mana_spec is not None:
+                log(f"[client] invalid mana spec '{bad_mana_spec}', expected e.g. mana:R1,U2")
+                continue
+
+            if send_activate_ability(conn, source_id, ability_index, targets, tap, mana):
+                log(f"[client] sent ACTIVATE_ABILITY {source_id} idx={ability_index} "
+                    f"tap={tap} mana={mana} targets={targets}")
             continue
 
         if normalized.startswith("damageorder"):
@@ -801,7 +834,7 @@ def interactive_loop(conn: Connection) -> None:
             log("  pass                          send PRIORITY_PASS")
             log("  cast <card_id> [targets...]   cast a spell, optionally with targets")
             log("  playland <card_id>            play a land from your hand")
-            log("  activate <src_id> <idx> [targets...]  activate a permanent's ability")
+            log("  activate <src_id> <idx> [tap] [mana:R1,U2] [targets...]  activate a permanent's ability")
             log("")
             log("  attack <ids...>               declare attackers (blank for none)")
             log("  block <atk_id>:<blk_id> ...   declare blockers as attacker:blocker pairs")
