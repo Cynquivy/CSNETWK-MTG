@@ -11,6 +11,44 @@ from model.card_database import card_database
 from model.mana import mana_output_of
 from network import pdu as pdu_builders
 
+DEMO_SEED = 4444
+
+DEMO_REQUIRED_CARDS = {
+    "chisa": [
+        "mountain_001",
+        "mountain_002",
+        "mountain_003",
+        "mountain_004",
+        "monastery_swiftspear_001",
+        "lightning_bolt_001",
+        "shock_001",
+        "sol_ring_001",
+        "searing_spear_001",
+        "goblin_guide_001",
+        "flame_slash_001",
+        "lava_spike_001",
+    ],
+    "wow": [
+        "island_001",
+        "island_002",
+        "island_003",
+        "island_004",
+        "ponder_001",
+        "ponder_002",
+        "unsummon_001",
+        "unsummon_002",
+        "merfolk_looter_001",
+        "cancel_001",
+        "cancel_002",
+        "air_elemental_001",
+        "ornithopter_001",
+        "counterspell_001",
+        "phantasmal_bear_001",
+    ],
+}
+
+client_seed = None
+
 seq_num = 1
 
 # Client-side state to track the last received sequence numbers for various events, 
@@ -685,12 +723,35 @@ def render_in_game_cli(state: dict, my_id: str) -> None:
     log("")
 
 
-def _build_sample_deck(limit: int = 50) -> list:
-    deck_ids = list(card_database.CARD_DATABASE.keys())
-    random.shuffle(deck_ids)
-    if len(deck_ids) < limit:
-        limit = len(deck_ids)
-    return deck_ids[:limit]
+def _build_sample_deck(player_id: str, limit: int = 50, seed: int | None = None) -> list:
+    all_cards = list(card_database.CARD_DATABASE.keys())
+
+    if seed == DEMO_SEED and player_id in DEMO_REQUIRED_CARDS:
+        required = DEMO_REQUIRED_CARDS[player_id]
+
+        missing = [
+            card_id
+            for card_id in required
+            if card_id not in card_database.CARD_DATABASE
+        ]
+
+        if missing:
+            raise RuntimeError(
+                f"Demo card IDs missing from CARD_DATABASE: {missing}"
+            )
+
+        filler = [
+            card_id
+            for card_id in sorted(all_cards)
+            if card_id not in required
+        ]
+
+        return (required + filler)[:limit]
+
+    rng = random.Random(seed)
+    rng.shuffle(all_cards)
+
+    return all_cards[:min(limit, len(all_cards))]
 
 
 def heartbeat_loop(conn: Connection, stop_event: threading.Event) -> None:
@@ -825,7 +886,7 @@ def interactive_loop(conn: Connection) -> None:
                 schedule_prompt()
                 continue
             player_id = parts[1]
-            deck_list = _build_sample_deck(50)
+            deck_list = _build_sample_deck(player_id, 50, client_seed)
             log(f"[client] sending PLAYER_READY player_id={player_id} deck_size={len(deck_list)}")
 
             client_state["player_id"] = player_id
@@ -1107,7 +1168,12 @@ def main() -> None:
                         help=f"GameServer TCP port (default: {protocol.DEFAULT_PORT})")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="print every PDU sent and received")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="deterministic deck seed")
     args = parser.parse_args()
+    
+    global client_seed
+    client_seed = args.seed
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
