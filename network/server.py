@@ -13,7 +13,8 @@ from model.creature import creature
 from model.instant import instant
 from model.card_database import card_database
 from model.stack import StackItem, StackItemType
-from model.mana import payment_covers_cost
+from model.mana import payment_covers_cost, card_id_base
+from model.effects import effect_for
 from model.triggers import TriggerEvent, trigger_definition_for
 from model.game_state import GameState
 from model.lifecycle import LifecycleState
@@ -997,17 +998,20 @@ class GameServer:
     def _targets_still_legal(self, targets) -> bool:
         """
         RFC 8.4 step 2 / ERROR code ILLEGAL_TARGET: a target is legal if
-        it names a still-seated player or a permanent currently on some
-        player's battlefield. This card set has no per-effect target-type
-        metadata yet (e.g. "target creature" vs "any target" vs "target
-        player"), so this is a structural existence check only -- real
-        per-effect target restrictions are Milestone #19's job once
-        actual card effects (and their target types) exist.
+        it names a still-seated player, a permanent currently on some
+        player's battlefield, or a Stack item still on the Stack (needed
+        for "counter target spell" effects, RFC 10.2.7's targets field
+        being a bare array of ids with no declared type). This card set
+        has no per-effect target-type metadata (e.g. "target creature" vs
+        "any target" vs "target player"), so this is a structural
+        existence check only -- real per-effect target restrictions are
+        model/effects.py's job.
         """
         with self.lock:
             permanent_ids = {c.card_id for p in self.game_state.players.values() for c in p.board}
             player_ids = set(self.game_state.players.keys())
-        return all(t in player_ids or t in permanent_ids for t in targets)
+            stack_item_ids = {item.stack_item_id for item in self.game_state.stack}
+        return all(t in player_ids or t in permanent_ids or t in stack_item_ids for t in targets)
 
     def _end_game(self, winner_id: str, loser_id: str, reason: str) -> None:
         """RFC 6.6: broadcast GAME_OVER (reason MUST be one of LIFE_ZERO |
@@ -1123,13 +1127,14 @@ class GameServer:
         # _targets_still_legal() acquires self.lock itself (threading.Lock
         # is not reentrant), so it must be called outside the block above.
         legal = self._targets_still_legal(item.targets)
-        # Milestone #19: real per-card effect application plugs in here
-        # once card effects exist. No effect is implemented yet -- see
-        # model/creature.py, instant.py, sorcery.py -- so a legal-target
-        # resolution is currently a structural no-op: this milestone
-        # delivers the resolution MECHANISM (push, target re-check, pop,
-        # broadcast, SBA check, re-grant), not any specific card's effect.
+
         state_changes = []
+        if legal and item.item_type == StackItemType.SPELL:
+            effect_fn = effect_for(card_id_base(item.source_id))
+            if effect_fn is not None:
+                with self.lock:
+                    state_changes = effect_fn(self.game_state, item.targets)
+
         result = "RESOLVED" if legal else "FIZZLE"
 
         with self.lock:
