@@ -14,10 +14,73 @@ from model.instant import instant
 from model.card_database import card_database
 from model.stack import StackItem, StackItemType
 from model.mana import payment_covers_cost, card_id_base
-from model.effects import effect_for
+from model.effects import effect_for, trigger_effect_for
 from model.triggers import TriggerEvent, trigger_definition_for
 from model.game_state import GameState
 from model.lifecycle import LifecycleState
+
+DEMO_SEED = 4444
+
+DEMO_OPENING_HANDS = {
+    "chisa": [
+        "mountain_001",
+        "mountain_002",
+        "mountain_003",
+        "monastery_swiftspear_001",
+        "lightning_bolt_001",
+        "shock_001",
+        "sol_ring_001",
+    ],
+    "wow": [
+        "island_001",
+        "ponder_001",
+        "unsummon_001",
+        "merfolk_looter_001",
+        "cancel_001",
+        "air_elemental_001",
+        "ornithopter_001",
+    ],
+}
+
+DEMO_MULLIGAN_HANDS = {
+    "wow": [
+        [
+            "island_001",
+            "island_002",
+            "ponder_001",
+            "unsummon_001",
+            "cancel_001",
+            "merfolk_looter_001",
+            "air_elemental_001",
+        ],
+        [
+            "island_001",
+            "island_002",
+            "counterspell_001",
+            "phantasmal_bear_001",
+            "air_elemental_001",
+            "ponder_001",
+            "unsummon_001",
+        ],
+    ]
+}
+
+DEMO_DRAW_ORDER = {
+    "chisa": [
+        "searing_spear_001",
+        "goblin_guide_001",
+        "mountain_004",
+        "flame_slash_001",
+        "lava_spike_001",
+    ],
+    "wow": [
+        "island_003",
+        "ponder_002",
+        "unsummon_002",
+        "cancel_002",
+        "island_004",
+    ],
+}
 
 MAX_PLAYERS = 2
 # RFC 4.2 / 10.2.5: the time_limit_ms advertised in every PRIORITY_GRANT.
@@ -47,12 +110,16 @@ class _PendingTrigger:
 
 
 class GameServer:
-    def __init__(self, host: str, port: int, verbose: bool):
+    def __init__(self, host: str, port: int, verbose: bool, seed: int | None = None):
         self.host = host
         self.port = port
         self.verbose = verbose
         self.clients = {}
         self.lock = threading.Lock()
+        self.seed = seed
+        self.rng = random.Random(seed)
+        self._demo_mulligan_stage = {}
+        self._demo_decks = {}
 
         # RFC 0001 Section 4.2: the server's single authoritative Game
         # State (model/game_state.py, Milestone #3). Starts in LOBBY
@@ -440,6 +507,36 @@ class GameServer:
             waiting_for=waiting_for,
         ))
 
+    def _using_demo_seed(self) -> bool:
+        return self.seed == DEMO_SEED
+
+    def _set_demo_hand(self, p, cards: list[str]) -> None:
+        full_deck = self._demo_decks[p.player_id]
+
+        missing = [card_id for card_id in cards if card_id not in full_deck]
+
+        if missing:
+            raise RuntimeError(
+                f"Demo deck for {p.player_id} is missing required cards: {missing}"
+            )
+
+        remaining = list(full_deck)
+
+        for card_id in cards:
+            remaining.remove(card_id)
+
+        draws = [
+            card_id
+            for card_id in DEMO_DRAW_ORDER.get(p.player_id, [])
+            if card_id in remaining
+        ]
+
+        for card_id in draws:
+            remaining.remove(card_id)
+
+        p.hand = list(cards)
+        p.library = remaining + list(reversed(draws))
+
     def _run_game_setup(self) -> None:
         """
         RFC 6.3 GAME_SETUP: "The server performs the following operations
@@ -454,13 +551,28 @@ class GameServer:
                 # RFC's PLAYER_READY carries no separate display-name
                 # field, so player_id doubles as both.
                 p = player(player_id, player_id)
-                p.initialize_library(deck_list)   # step 2 (life=20 default) + step 3 (shuffle)
-                p.draw_from_lib(7)                 # step 4
+
+                if self._using_demo_seed():
+                    self._demo_decks[player_id] = list(deck_list)
+
+                if self._using_demo_seed() and player_id in DEMO_OPENING_HANDS:
+                    p.initialize_library(deck_list)
+                    self._set_demo_hand(p, DEMO_OPENING_HANDS[player_id])
+                    self._demo_mulligan_stage[player_id] = 0
+                else:
+                    p.initialize_library(deck_list)   # step 2 (life=20 default) + step 3 (shuffle)
+                    p.draw_from_lib(7)                 # step 4
+
                 self.game_state.add_player(p)
 
             self.game_state.turn = 0  # RFC 6.5: turn becomes 1 only once IN_GAME begins
-            # step 5: coin flip
-            self.game_state.active_player_id = random.choice(list(self.game_state.players.keys()))
+
+            if self._using_demo_seed() and "chisa" in self.game_state.players:
+                self.game_state.active_player_id = "chisa"
+            else:
+                # step 5: coin flip
+                self.game_state.active_player_id = random.choice(list(self.game_state.players.keys()))
+
             self.game_state.lifecycle_state = LifecycleState.MULLIGAN
             self.pending_decks.clear()
 
@@ -559,10 +671,24 @@ class GameServer:
             # London Mulligan redraw (RFC 6.4): shuffle the hand back in,
             # draw a fresh 7. The bottoming happens only once they keep.
             p.mulligan_count += 1
-            p.library.extend(p.hand)
-            p.hand.clear()
-            random.shuffle(p.library)
-            p.draw_from_lib(7)
+
+            if self._using_demo_seed() and player_id in DEMO_MULLIGAN_HANDS:
+                stage = self._demo_mulligan_stage.get(player_id, 0)
+                scripted_hands = DEMO_MULLIGAN_HANDS[player_id]
+
+                if stage < len(scripted_hands):
+                    self._set_demo_hand(p, scripted_hands[stage])
+                    self._demo_mulligan_stage[player_id] = stage + 1
+                else:
+                    p.library.extend(p.hand)
+                    p.hand.clear()
+                    self.rng.shuffle(p.library)
+                    p.draw_from_lib(7)
+            else:
+                p.library.extend(p.hand)
+                p.hand.clear()
+                self.rng.shuffle(p.library)
+                p.draw_from_lib(7)
 
             conn.send_pdu(pdu_builders.build_game_state_update_in_game(
                 seq_num=conn.next_seq(),
@@ -995,7 +1121,7 @@ class GameServer:
         self._stack_id_counter += 1
         return f"stk_{self._stack_id_counter:02d}"
 
-    def _targets_still_legal(self, targets) -> bool:
+    def _targets_still_legal(self, targets, allow_graveyard: bool = False) -> bool:
         """
         RFC 8.4 step 2 / ERROR code ILLEGAL_TARGET: a target is legal if
         it names a still-seated player, a permanent currently on some
@@ -1011,7 +1137,10 @@ class GameServer:
             permanent_ids = {c.card_id for p in self.game_state.players.values() for c in p.board}
             player_ids = set(self.game_state.players.keys())
             stack_item_ids = {item.stack_item_id for item in self.game_state.stack}
-        return all(t in player_ids or t in permanent_ids or t in stack_item_ids for t in targets)
+            graveyard_ids = ({cid for p in self.game_state.players.values() for cid in p.graveyard}
+                              if allow_graveyard else set())
+        return all(t in player_ids or t in permanent_ids or t in stack_item_ids or t in graveyard_ids
+                   for t in targets)
 
     def _end_game(self, winner_id: str, loser_id: str, reason: str) -> None:
         """RFC 6.6: broadcast GAME_OVER (reason MUST be one of LIFE_ZERO |
@@ -1126,14 +1255,41 @@ class GameServer:
 
         # _targets_still_legal() acquires self.lock itself (threading.Lock
         # is not reentrant), so it must be called outside the block above.
-        legal = self._targets_still_legal(item.targets)
+        legal = self._targets_still_legal(
+            item.targets, allow_graveyard=(item.item_type == StackItemType.TRIGGER_ABILITY))
 
         state_changes = []
-        if legal and item.item_type == StackItemType.SPELL:
-            effect_fn = effect_for(card_id_base(item.source_id))
-            if effect_fn is not None:
-                with self.lock:
-                    state_changes = effect_fn(self.game_state, item.targets)
+        entered_permanent = None
+        if legal:
+            if item.item_type == StackItemType.SPELL:
+                spell_card = card_database.CARD_DATABASE.get(item.source_id)
+                if spell_card is not None and spell_card.card_type not in ("Instant", "Sorcery"):
+                    controller = self.game_state.players.get(item.controller_id)
+                    if controller is not None:
+                        with self.lock:
+                            if isinstance(spell_card, creature):
+                                spell_card.is_tapped = False
+                                spell_card.summoning_sick = True
+                            controller.board.append(spell_card)
+                        state_changes.append({
+                            "change_type": "PERMANENT_ENTERS",
+                            "card_id": item.source_id,
+                            "controller": item.controller_id,
+                            "tapped": getattr(spell_card, "is_tapped", False),
+                        })
+                        entered_permanent = (item.source_id, item.controller_id)
+
+                effect_fn = effect_for(card_id_base(item.source_id))
+                if effect_fn is not None:
+                    with self.lock:
+                        state_changes.extend(effect_fn(self.game_state, item.targets))
+
+            elif item.item_type == StackItemType.TRIGGER_ABILITY:
+                trigger_fn = trigger_effect_for(card_id_base(item.source_id))
+                if trigger_fn is not None:
+                    with self.lock:
+                        state_changes.extend(trigger_fn(
+                            self.game_state, item.source_id, item.controller_id, item.targets))
 
         result = "RESOLVED" if legal else "FIZZLE"
 
@@ -1166,8 +1322,15 @@ class GameServer:
                 viewer_player_id=player_id,
             ))
 
-        # RFC 8.1 rule 5: "The Active Player then receives priority again."
-        self._open_priority_window()
+        triggered = False
+        if entered_permanent is not None:
+            source_id, controller_id = entered_permanent
+            triggered = self._check_triggers(
+                [(TriggerEvent.ENTERS_BATTLEFIELD, [(source_id, controller_id)])])
+
+        if not triggered:
+            # RFC 8.1 rule 5: "The Active Player then receives priority again."
+            self._open_priority_window()
 
     def _handle_cast_spell(self, label: str, conn: Connection, pdu: dict) -> None:
         if self.game_state.lifecycle_state != LifecycleState.IN_GAME:
@@ -1302,13 +1465,12 @@ class GameServer:
         # responsible for eventually granting priority back to this
         # caster (RFC 8.1 rule 3); otherwise grant it immediately as
         # before.
-        triggered = False
+        event_candidate_pairs = [(TriggerEvent.BECOMES_TARGET, self._becomes_target_candidates(targets))]
         if not isinstance(spell, creature):
-            triggered = self._check_triggers(
-                TriggerEvent.CAST_NONCREATURE_SPELL,
-                [(c.card_id, player_id) for c in caster.board],
-                retain_priority_for=player_id,
-            )
+            event_candidate_pairs.append(
+                (TriggerEvent.CAST_NONCREATURE_SPELL, [(c.card_id, player_id) for c in caster.board]))
+
+        triggered = self._check_triggers(event_candidate_pairs, retain_priority_for=player_id)
 
         if triggered:
             # RFC 8.6.1: "Priority MUST NOT be granted until all pending
@@ -1411,7 +1573,15 @@ class GameServer:
         for c in recipients:
             c.send_pdu(pdu_builders.build_stack_push(seq_num=c.next_seq(), stack_item=item))
 
-        self._send_priority_grant(player_id, conn=conn)
+        triggered = self._check_triggers(
+            [(TriggerEvent.BECOMES_TARGET, self._becomes_target_candidates(targets))],
+            retain_priority_for=player_id,
+        )
+
+        if triggered:
+            self._cancel_priority_timeout()
+        else:
+            self._send_priority_grant(player_id, conn=conn)
 
     ### TRIGGERED ABILITIES (RFC Section 8.6) ###
 
@@ -1436,7 +1606,17 @@ class GameServer:
                 ids.extend(p.graveyard)
         return ids
 
-    def _check_triggers(self, event, candidates, retain_priority_for=None) -> bool:
+    def _becomes_target_candidates(self, targets) -> list:
+        candidates = []
+        with self.lock:
+            for target_id in targets:
+                for p in self.game_state.players.values():
+                    for permanent in p.board:
+                        if permanent.card_id == target_id:
+                            candidates.append((target_id, p.player_id))
+        return candidates
+
+    def _check_triggers(self, event_candidate_pairs, retain_priority_for=None) -> bool:
         """
         RFC 8.6.1: after a qualifying event, check the given (card_id,
         controller_id) candidates against the trigger registry. `candidates`
@@ -1455,15 +1635,16 @@ class GameServer:
         as usual.
         """
         fired = []
-        for card_id, controller_id in candidates:
-            definition = trigger_definition_for(card_id)
-            if definition and definition.event is event:
-                fired.append(_PendingTrigger(
-                    trigger_id=self._next_trigger_id(),
-                    source_id=card_id,
-                    controller_id=controller_id,
-                    definition=definition,
-                ))
+        for event, candidates in event_candidate_pairs:
+            for card_id, controller_id in candidates:
+                definition = trigger_definition_for(card_id)
+                if definition and definition.event is event:
+                    fired.append(_PendingTrigger(
+                        trigger_id=self._next_trigger_id(),
+                        source_id=card_id,
+                        controller_id=controller_id,
+                        definition=definition,
+                    ))
 
         if not fired:
             return False
@@ -1867,7 +2048,11 @@ class GameServer:
             c.send_pdu(pdu_builders.build_game_state_update_in_game(
                 seq_num=c.next_seq(), game_state=self.game_state, viewer_player_id=pid))
 
-        self._open_priority_window()
+        triggered = self._check_triggers(
+            [(TriggerEvent.ATTACKS, [(attacker.card_id, player_id) for attacker, _ in resolved])])
+
+        if not triggered:
+            self._open_priority_window()
 
     def _handle_declare_blockers(self, label: str, conn: Connection, pdu: dict) -> None:
         if self.game_state.lifecycle_state != LifecycleState.IN_GAME or self.game_state.phase is not Phase.DECLARE_BLOCKERS:
@@ -2385,8 +2570,10 @@ def main() -> None:
                         help=f"TCP port (default: {protocol.DEFAULT_PORT})")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="print every PDU sent and received")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="deterministic game seed")
     args = parser.parse_args()
-    GameServer(args.host, args.port, args.verbose).start()
+    GameServer(args.host, args.port, args.verbose, args.seed).start()
 
 if __name__ == "__main__":
     main()

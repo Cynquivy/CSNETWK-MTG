@@ -1,6 +1,7 @@
 from model.creature import creature
 from model.artifact import artifact
 from model.enchantment import enchantment
+from model.card_database import card_database
 
 
 def _find_permanent(game_state, permanent_id):
@@ -124,3 +125,77 @@ EFFECTS = {
 
 def effect_for(card_id_base: str):
     return EFFECTS.get(card_id_base)
+
+
+def _goblin_guide_attack(game_state, source_id, controller_id, targets):
+    controller = game_state.players.get(controller_id)
+    opponent = game_state.opponent_of(controller_id) if controller else None
+    if opponent is None or not opponent.library:
+        return []
+    top_id = opponent.library[-1]
+    top_card = card_database.CARD_DATABASE.get(top_id)
+    changes = [{"change_type": "REVEAL", "target": top_id}]
+    if top_card is not None and getattr(top_card, "card_type", None) == "Land":
+        opponent.library.pop()
+        opponent.hand.append(top_id)
+        changes.append({"change_type": "HAND_ADD", "target": opponent.player_id, "card_id": top_id})
+    return changes
+
+
+def _prowess(game_state, source_id, controller_id, targets):
+    _, permanent = _find_permanent(game_state, source_id)
+    if not isinstance(permanent, creature):
+        return []
+    permanent.power += 1
+    permanent.toughness += 1
+    return [{"change_type": "PUMP", "target": source_id, "power": 1, "toughness": 1}]
+
+
+def _sacrifice_self(game_state, source_id, controller_id, targets):
+    return _destroy(game_state, [source_id])
+
+
+def _devotion_drain(game_state, source_id, controller_id, targets, color):
+    controller = game_state.players.get(controller_id)
+    opponent = game_state.opponent_of(controller_id) if controller else None
+    if controller is None or opponent is None:
+        return []
+    field = {"W": "mana_white", "U": "mana_blue", "B": "mana_black",
+              "R": "mana_red", "G": "mana_green"}[color]
+    devotion = sum(getattr(permanent, field, 0) for permanent in controller.board)
+    if devotion <= 0:
+        return []
+    opponent.life -= devotion
+    controller.life += devotion
+    return [
+        {"change_type": "DAMAGE", "target": opponent.player_id, "amount": devotion},
+        {"change_type": "LIFE_GAIN", "target": controller_id, "amount": devotion},
+    ]
+
+
+def _return_from_graveyard(game_state, source_id, controller_id, targets):
+    controller = game_state.players.get(controller_id)
+    if controller is None or not targets:
+        return []
+    target_id = targets[0]
+    if target_id not in controller.graveyard:
+        return []
+    card_obj = card_database.CARD_DATABASE.get(target_id)
+    if not isinstance(card_obj, creature):
+        return []
+    controller.graveyard.remove(target_id)
+    controller.hand.append(target_id)
+    return [{"change_type": "RETURN_TO_HAND", "target": target_id}]
+
+
+TRIGGER_EFFECTS = {
+    "goblin_guide": _goblin_guide_attack,
+    "monastery_swiftspear": _prowess,
+    "phantasmal_bear": _sacrifice_self,
+    "gray_merchant": lambda gs, sid, cid, targets: _devotion_drain(gs, sid, cid, targets, "B"),
+    "gravedigger": _return_from_graveyard,
+}
+
+
+def trigger_effect_for(card_id_base: str):
+    return TRIGGER_EFFECTS.get(card_id_base)
