@@ -465,6 +465,46 @@ def send_discard(conn: Connection, card_ids: list) -> bool:
     conn.send_pdu(pdu_builders.build_discard(seq, card_ids))
     return True
 
+def format_mana_pool(mana_pool: dict) -> str:
+    colors = ["W", "U", "B", "R", "G"]
+    return "   [" + ", ".join(colors) + "]\n   [" + ", ".join(str(mana_pool.get(color, 0)) for color in colors) + "]"
+
+def format_mana_cost(card_id: str) -> str:
+    card = card_database.CARD_DATABASE.get(card_id)
+
+    if card is None:
+        return card_id
+
+    if getattr(card, "card_type", None) == "Land":
+        return f"{card_id} (Land - {card.color})"
+
+    cost = ""
+
+    if card.mana_generic > 0:
+        cost += str(card.mana_generic)
+
+    cost += "W" * card.mana_white
+    cost += "U" * card.mana_blue
+    cost += "B" * card.mana_black
+    cost += "R" * card.mana_red
+    cost += "G" * card.mana_green
+
+    if not cost:
+        cost = "0"
+
+    return f"{card_id} ({cost})"
+
+
+def format_permanent(permanent: dict) -> str:
+    card_id = permanent["id"]
+    card = card_database.CARD_DATABASE.get(card_id)
+
+    if card is not None and getattr(card, "card_type", None) == "Creature":
+        power = permanent.get("power", getattr(card, "power", "?"))
+        toughness = permanent.get("toughness", getattr(card, "toughness", "?"))
+        return f"{card_id} ({power}/{toughness})"
+
+    return card_id
 
 def render_in_game_cli(state: dict, my_id: str) -> None:
     width = 80
@@ -479,9 +519,15 @@ def render_in_game_cli(state: dict, my_id: str) -> None:
     log("IN_GAME".center(width))
     log("=" * width)
     log(f" Turn {turn}  |  Phase: {phase}  |  Active: {active}")
+    
+    mana_pool = state.get("mana_pool", {}).get(my_id, {}) if my_id else {}
+
     log(f" Life totals: {life}")
+    log(" Mana:")
+    log(format_mana_pool(mana_pool))
     log(f" Your hand ({len(hand)}):")
-    log("   " + ", ".join(hand) if hand else "   (empty)")
+    log("   " + ", ".join(format_mana_cost(card_id) for card_id in hand) if hand else "   (empty)")
+    
     log("")
 
     log(" Battlefield:")
@@ -490,7 +536,7 @@ def render_in_game_cli(state: dict, my_id: str) -> None:
             log(f"   {side}: (empty)")
             continue
         perm_str = ", ".join(
-            f"{p['id']} ({'tapped' if p['tapped'] else 'untapped'})"
+            f"{format_permanent(p)} [{'T' if p['tapped'] else 'U'}]"
             for p in permanents
         )
         log(f"   {side}: {perm_str}")
@@ -963,7 +1009,8 @@ def render_mulligan_cli(state: dict, my_id: str) -> None:
     log("=" * width)
     log(f" Turn {state.get('turn')}  |  Active player: {state.get('active_player')}")
     log(f" You have mulliganed {mulligan_count} time(s)")
-    log(f" Your hand ({len(hand)}): {', '.join(hand) if hand else '(empty)'}")
+
+    log(f" Your hand ({len(hand)}): {', '.join(format_mana_cost(card_id) for card_id in hand) if hand else '(empty)'}")
 
     # Once this player has submitted a keep, they should wait for the other
     # player rather than receiving another mulligan prompt.
