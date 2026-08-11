@@ -256,7 +256,7 @@ class Connection:
             src, dst = self.local, self.peer
         else:
             src, dst = self.peer, self.local
-        log(f"[{stamp}] [{src} -> {dst}] {json.dumps(pdu)}")
+        log(f"[{stamp}] [{src} -> {dst}]\n{json.dumps(pdu, indent=2)}")
 
     def close(self) -> None:
         try:
