@@ -1163,6 +1163,41 @@ class GameServer:
 
         # RFC 8.1 rule 5: "The Active Player then receives priority again."
         self._open_priority_window()
+        
+    def _pay_mana_from_sources(self, player_obj, mana_payment: dict) -> bool:
+        colors = ["W", "U", "B", "R", "G"]
+    
+        required = {
+            color: int(mana_payment.get(color, 0))
+            for color in colors
+        }
+    
+        selected = []
+    
+        for color in colors:
+            needed = required[color]
+    
+            if needed <= 0:
+                continue
+    
+            matching_sources = [
+                permanent
+                for permanent in player_obj.board
+                if getattr(permanent, "card_type", None) == "Land"
+                and getattr(permanent, "color", None) == color
+                and not getattr(permanent, "is_tapped", False)
+            ]
+    
+            if len(matching_sources) < needed:
+                return False
+    
+            selected.extend(matching_sources[:needed])
+    
+        # Only mutate after the entire payment has been validated.
+        for source in selected:
+            source.is_tapped = True
+    
+        return True
 
     def _handle_cast_spell(self, label: str, conn: Connection, pdu: dict) -> None:
         if self.game_state.lifecycle_state != LifecycleState.IN_GAME:
@@ -1239,11 +1274,22 @@ class GameServer:
                 rejected_action=pdu))
             return
 
-        if not payment_covers_cost(mana_payment, spell) or not caster.pay_mana(mana_payment):
+        if not payment_covers_cost(mana_payment, spell):
             conn.send_pdu(pdu_builders.build_error(
-                seq_num=conn.next_seq(), code="INSUFFICIENT_MANA",
+                seq_num=conn.next_seq(),
+                code="INSUFFICIENT_MANA",
                 message="mana_payment does not satisfy this spell's cost.",
-                rejected_action=pdu))
+                rejected_action=pdu
+            ))
+            return
+        
+        if not self._pay_mana_from_sources(caster, mana_payment):
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(),
+                code="INSUFFICIENT_MANA",
+                message="Not enough untapped mana sources to satisfy mana_payment.",
+                rejected_action=pdu
+            ))
             return
 
         with self.lock:
@@ -1265,6 +1311,17 @@ class GameServer:
 
         for c in recipients:
             c.send_pdu(pdu_builders.build_stack_push(seq_num=c.next_seq(), stack_item=item))
+            
+        for pid in self.game_state.players:
+            recv_conn = self.clients[self.player_id_to_label[pid]]
+        
+            recv_conn.send_pdu(
+                pdu_builders.build_game_state_update_in_game(
+                    seq_num=recv_conn.next_seq(),
+                    game_state=self.game_state,
+                    viewer_player_id=pid
+                )
+            )
 
         # RFC 8.6.1: "A spell or ability is cast" MUST trigger a check --
         # e.g. Prowess ("whenever YOU cast a noncreature spell"), which is

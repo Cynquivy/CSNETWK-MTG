@@ -34,9 +34,9 @@ client_state = {
     "last_trigger_choice_id": None,
 }
 
-console_lock = threading.Lock()
 prompt_visible = False
-
+prompt_timer = None
+console_lock = threading.Lock()
 
 def show_prompt() -> None:
     global prompt_visible
@@ -61,6 +61,18 @@ def consume_prompt() -> None:
 
     with console_lock:
         prompt_visible = False
+
+
+def schedule_prompt(delay: float = 0.05) -> None:
+    global prompt_timer
+
+    with console_lock:
+        if prompt_timer is not None:
+            prompt_timer.cancel()
+
+        prompt_timer = threading.Timer(delay, show_prompt)
+        prompt_timer.daemon = True
+        prompt_timer.start()
 
 def _handle_game_state_update(conn: Connection, pdu: dict) -> None:
     state = pdu.get("state", {})
@@ -112,12 +124,12 @@ def handle_mulligan_command(conn: Connection, parts: list) -> None:
 
     if player_id is None:
         log("[client] you must `ready <player_id>` first")
-        show_prompt()
+        schedule_prompt()
         return
 
     if client_state["last_game_state"] is None:
         log("[client] no game state available yet")
-        show_prompt()
+        schedule_prompt()
         return
 
     # takes the current hand from the last game state update, which is used to determine which cards can be bottomed during a mulligan decision.
@@ -130,7 +142,7 @@ def handle_mulligan_command(conn: Connection, parts: list) -> None:
         if send_mulligan_choice(conn, keep=False, cards_to_bottom=[]):
             log("[client] sent MULLIGAN_CHOICE keep=False")
         else:
-            show_prompt()
+            schedule_prompt()
 
         return
 
@@ -151,19 +163,19 @@ def handle_mulligan_command(conn: Connection, parts: list) -> None:
         # Case 4: Player has mulliganed but didn't specify cards to bottom
         else:
             log("[client] must specify cards to bottom or use 'mulligan keep auto'")
-            show_prompt()
+            schedule_prompt()
             return
 
         if send_mulligan_choice(conn, keep=True, cards_to_bottom=cards_to_bottom):
             log(f"[client] sent MULLIGAN_CHOICE keep=True bottom {cards_to_bottom}")
         else:
-            show_prompt()
+            schedule_prompt()
 
         return
 
     else:
         log(f"[client] unknown mulligan verb '{verb}' -- use 'mull' or 'keep'")
-        show_prompt()
+        schedule_prompt()
 
 def _handle_phase_transition(conn: Connection, pdu: dict) -> None:
     clear_prompt()
@@ -193,7 +205,6 @@ def _handle_phase_transition(conn: Connection, pdu: dict) -> None:
 
         log(f"[client] your battlefield: {battlefield}")
         log("[client] type: attack <id1> <id2> ...  (or just 'attack' for none)")
-        show_prompt()
 
     elif to_phase == "DECLARE_BLOCKERS" and active_player != my_id:
         client_state["awaiting_action"] = "DECLARE_BLOCKERS"
@@ -202,7 +213,6 @@ def _handle_phase_transition(conn: Connection, pdu: dict) -> None:
 
         log(f"[client] your battlefield: {battlefield}")
         log("[client] type: block <attacker_id> <blocker_id>  (or just 'block' for none)")
-        show_prompt()
 
 
 def _handle_priority_grant(conn: Connection, pdu: dict) -> None:
@@ -216,7 +226,6 @@ def _handle_priority_grant(conn: Connection, pdu: dict) -> None:
     if client_state["player_id"] == player_id:
         client_state["has_priority"] = True
         client_state["last_priority_grant_seq"] = pdu.get("seq_num")
-        show_prompt()
     else:
         client_state["has_priority"] = False
         client_state["last_priority_grant_seq"] = None
@@ -258,8 +267,6 @@ def _handle_game_over(conn: Connection, pdu: dict) -> None:
     log("")
 
 def _handle_error(conn: Connection, pdu: dict) -> None:
-    clear_prompt()
-
     rejected_action = pdu.get("rejected_action", {})
 
     # If a MULLIGAN_CHOICE was rejected, the player has not successfully kept yet,
@@ -268,16 +275,12 @@ def _handle_error(conn: Connection, pdu: dict) -> None:
         client_state["waiting_after_keep"] = False
 
     log(f"[client] ERROR: {pdu.get('code')} - {pdu.get('message')}")
-    show_prompt()
 
 def _handle_pong(conn: Connection, pdu: dict) -> None:
-    clear_prompt()
-
     now = int(time.time() * 1000)
     rtt = now - pdu["timestamp"]
 
     log(f"[client] PONG received (seq_num={pdu['seq_num']}), rtt={rtt}ms")
-    show_prompt()
 
 
 # IN_GAME PDU send helpers
@@ -296,14 +299,117 @@ def send_priority_pass(conn: Connection) -> bool:
     return True
 
 
-def send_cast_spell(conn: Connection, card_id: str, targets: list, mana_payment: dict = None) -> bool:
+def build_implicit_mana_payment(card_id: str) -> dict | None:
+    card = card_database.CARD_DATABASE.get(card_id)
+
+    if card is None:
+        return None
+
+    state_pdu = client_state.get("last_game_state")
+    if state_pdu is None:
+        return None
+
+    state = state_pdu.get("state", {})
+    my_id = client_state.get("player_id")
+    battlefield = state.get("battlefield", {}).get(my_id, [])
+
+    available = {
+        "W": [],
+        "U": [],
+        "B": [],
+        "R": [],
+        "G": []
+    }
+
+    for permanent in battlefield:
+        if permanent.get("tapped"):
+            continue
+
+        permanent_id = permanent.get("id")
+        permanent_card = card_database.CARD_DATABASE.get(permanent_id)
+
+        if permanent_card is None:
+            continue
+
+        if getattr(permanent_card, "card_type", None) != "Land":
+            continue
+
+        color = getattr(permanent_card, "color", None)
+
+        if color in available:
+            available[color].append(permanent_id)
+
+    required = {
+        "W": card.mana_white,
+        "U": card.mana_blue,
+        "B": card.mana_black,
+        "R": card.mana_red,
+        "G": card.mana_green
+    }
+
+    payment = {
+        "W": 0,
+        "U": 0,
+        "B": 0,
+        "R": 0,
+        "G": 0
+    }
+
+    used = set()
+
+    # First satisfy colored requirements.
+    for color in ["W", "U", "B", "R", "G"]:
+        if len(available[color]) < required[color]:
+            return None
+
+        for land_id in available[color][:required[color]]:
+            used.add(land_id)
+            payment[color] += 1
+
+    # Then pay generic mana using any remaining untapped lands.
+    generic_remaining = card.mana_generic
+
+    for color in ["W", "U", "B", "R", "G"]:
+        for land_id in available[color]:
+            if generic_remaining == 0:
+                break
+
+            if land_id in used:
+                continue
+
+            used.add(land_id)
+            payment[color] += 1
+            generic_remaining -= 1
+
+        if generic_remaining == 0:
+            break
+
+    if generic_remaining > 0:
+        return None
+
+    return {color: amount for color, amount in payment.items() if amount > 0}
+
+def send_cast_spell(conn: Connection, card_id: str, targets: list) -> bool:
     seq = client_state["last_priority_grant_seq"]
 
     if not client_state["has_priority"] or seq is None:
         log("[client] you do not currently have priority")
         return False
 
-    conn.send_pdu(pdu_builders.build_cast_spell(seq, card_id, list(targets), mana_payment or {}))
+    mana_payment = build_implicit_mana_payment(card_id)
+
+    if mana_payment is None:
+        log("[client] not enough available mana sources")
+        return False
+
+    conn.send_pdu(
+        pdu_builders.build_cast_spell(
+            seq,
+            card_id,
+            list(targets),
+            mana_payment
+        )
+    )
 
     return True
 
@@ -316,7 +422,7 @@ def send_play_land(conn: Connection, card_id: str) -> bool:
 
     if phase not in ("PRECOMBAT_MAIN", "POSTCOMBAT_MAIN"):
         log("[client] PLAY_LAND is only legal during a Main phase.")
-        show_prompt()
+        schedule_prompt()
         return False
 
     if active_player != player_id:
@@ -325,7 +431,7 @@ def send_play_land(conn: Connection, card_id: str) -> bool:
 
     if seq is None:
         log("[client] no PRIORITY_GRANT recorded -- cannot play land")
-        show_prompt()
+        schedule_prompt()
         return False
 
     conn.send_pdu(pdu_builders.build_play_land(seq, card_id))
@@ -336,7 +442,7 @@ def send_declare_attackers(conn: Connection, attackers: list) -> bool:
     # DECLARE_ATTACKERS is only valid during the Declare Attackers Step.
     if client_state["current_phase"] != "DECLARE_ATTACKERS":
         log("[client] cannot declare attackers outside the Declare Attackers Step")
-        show_prompt()
+        schedule_prompt()
         return False
 
     # Only the Active Player may declare attackers.
@@ -532,11 +638,40 @@ def render_in_game_cli(state: dict, my_id: str) -> None:
     log("=" * width)
     log(f" Turn {turn}  |  Phase: {phase}  |  Active: {active}")
     
-    mana_pool = state.get("mana_pool", {}).get(my_id, {}) if my_id else {}
-
+    available_mana = {
+        "W": 0,
+        "U": 0,
+        "B": 0,
+        "R": 0,
+        "G": 0
+    }
+    
+    my_battlefield = battlefield.get(my_id, []) if my_id else []
+    
+    for permanent in my_battlefield:
+        if permanent.get("tapped", False):
+            continue
+    
+        card_id = permanent.get("id")
+        card = card_database.CARD_DATABASE.get(card_id)
+    
+        if card is None:
+            continue
+    
+        if getattr(card, "card_type", None) != "Land":
+            continue
+    
+        color = getattr(card, "color", None)
+    
+        if color in available_mana:
+            available_mana[color] += 1
+    
     log(f" Life totals: {life}")
-    log(" Mana:")
-    log(format_mana_pool(mana_pool))
+    log(" Available Mana:")
+    log("   [W, U, B, R, G]")
+    log("   [" + ", ".join(str(available_mana[color]) for color in ["W", "U", "B", "R", "G"]) + "]")
+    log("")
+    
     log(f" Your hand ({len(hand)}):")
     log("   " + ", ".join(format_mana_cost(card_id) for card_id in hand) if hand else "   (empty)")
     
@@ -555,11 +690,11 @@ def render_in_game_cli(state: dict, my_id: str) -> None:
     log("-" * width)
     log(" Commands (in-game):")
     log("  pass                        -- send PRIORITY_PASS")
-    log("  cast <card_id> [mana:R1,U2] [targets...] -- cast a spell, optionally paying mana and/or targeting")
+    log("  cast <card_id> [targets...] -- cast a spell with optional targets")
     log("  playland <card_id>          -- play a land from your hand")
     log("  attack <creature_ids...>    -- declare attackers (space-separated)")
     log("  block <attacker:blocker ...>-- declare blockers as pairs attacker:blocker")
-    log("  discard <card_id ...>       -- declare blockers as pairs attacker:blocker")
+    log("  discard <card_id ...>       -- discard cards")
     log("  concede                     -- concede the game")
     log("  state                       -- print last GAME_STATE_UPDATE")
     log("  phase                       -- print current phase")
@@ -597,11 +732,16 @@ def receive_loop(conn: Connection, stop_event: threading.Event) -> None:
 
         client_state["last_any_server_seq"] = response.get("seq_num")
 
+        clear_prompt()
+
         handler = _handlers.get(response["type"])
+        
         if handler is None:
             log(f"[client] Unknown pdu type {response['type']}!")
         else:
             handler(conn, response)
+        
+        schedule_prompt()
 
 
 # Handler table to call the corresponding method of each pdu type
@@ -640,21 +780,21 @@ def run_self_test(conn: Connection) -> None:
 
 def interactive_loop(conn: Connection) -> None:
     ping_seq = 1
+
+    schedule_prompt()
+
     while True:
-        if client_state["waiting_after_keep"]:
-            time.sleep(0.05)
-            continue
-        
         try:
-            # "[client] >" is printed inside the CLI methods because this input() is called first
-            # before the CLI methods are called, so the "[client] > " prompt is printed after the CLI output. 
             command = input()
+            consume_prompt()
+            
         except EOFError: # e.g. stdin closed
             break
 
         normalized = command.strip().lower()
 
         if not normalized:
+            schedule_prompt()
             continue
 
         if normalized == "ping":
@@ -672,7 +812,7 @@ def interactive_loop(conn: Connection) -> None:
             parts = command.strip().split()
             if len(parts) < 2:
                 log("[client] usage: ready <player_id>")
-                print("[client] > ", end="", flush=True)
+                schedule_prompt()
                 continue
             player_id = parts[1]
             deck_list = _build_sample_deck(50)
@@ -698,37 +838,24 @@ def interactive_loop(conn: Connection) -> None:
                 continue
             if send_priority_pass(conn):
                 log("[client] sent PRIORITY_PASS")
-            print("[client] > ", end="", flush=True)
+            schedule_prompt()
             continue
         
         if normalized.startswith("cast"):
             parts = command.strip().split()
-
+        
             if len(parts) < 2:
-                log("[client] usage: cast <card_id> [mana:R1,U2] [target1 target2 ...]")
+                log("[client] usage: cast <card_id> [target1 target2 ...]")
+                schedule_prompt()
                 continue
-
+        
             card_id = parts[1]
-            mana_payment = {}
-            targets = []
-            bad_mana_spec = None
-            for token in parts[2:]:
-                if token.lower().startswith("mana:"):
-                    parsed = parse_mana_spec(token[len("mana:"):])
-                    if parsed is None:
-                        bad_mana_spec = token
-                        break
-                    mana_payment.update(parsed)
-                else:
-                    targets.append(token)
-
-            if bad_mana_spec is not None:
-                log(f"[client] invalid mana spec '{bad_mana_spec}', expected e.g. mana:R1,U2")
-                continue
-
-            if send_cast_spell(conn, card_id, targets, mana_payment):
-                log(f"[client] sent CAST_SPELL {card_id} mana_payment={mana_payment} targets={targets}")
-
+            targets = parts[2:]
+        
+            if send_cast_spell(conn, card_id, targets):
+                log(f"[client] sent CAST_SPELL {card_id} targets={targets}")
+        
+            schedule_prompt()
             continue
         
         if normalized.startswith("playland"):
@@ -864,10 +991,7 @@ def interactive_loop(conn: Connection) -> None:
         
         if normalized == "state":
             log(f"[client] last GAME_STATE_UPDATE: {client_state.get('last_game_state')}")
-            
-            if client_state["has_priority"]:
-                show_prompt()
-            
+            schedule_prompt()
             continue
         
         if normalized == "phase":
@@ -878,10 +1002,8 @@ def interactive_loop(conn: Connection) -> None:
             else:
                 log("[client] no game state yet")
                 
-            if client_state["has_priority"]:
-                show_prompt()
-        
-            continue
+            schedule_prompt()
+            continue    
         
         if normalized == "help":
             log("[client] commands:")
@@ -893,7 +1015,7 @@ def interactive_loop(conn: Connection) -> None:
             log("  mulligan keep <ids>           keep and bottom the listed card ids")
             log("")
             log("  pass                          send PRIORITY_PASS")
-            log("  cast <card_id> [mana:R1,U2] [targets...]  cast a spell, optionally paying mana and/or targeting")
+            log("  cast <card_id> [targets...]        cast a spell with optional targets")
             log("  playland <card_id>            play a land from your hand")
             log("  activate <src_id> <idx> [tap] [mana:R1,U2] [targets...]  activate a permanent's ability")
             log("")
@@ -912,11 +1034,11 @@ def interactive_loop(conn: Connection) -> None:
             log("  phase                         print the current phase")
             log("  help                          show this list")
             log("  q                             quit")
-            show_prompt()
+            schedule_prompt()
             continue
         
         log(f"[client] unknown command: {command}")
-        print("[client] > ", end="", flush=True)
+        schedule_prompt()
         continue
 
 
@@ -1032,7 +1154,6 @@ def render_lobby_cli(state: dict) -> None:
         log("   q                   -- quit")
         log("=" * width)
         log(" Waiting in LOBBY -- type 'ready <player_id>' to begin")
-        show_prompt()
         return
 
     log("=" * width)
@@ -1075,7 +1196,6 @@ def render_mulligan_cli(state: dict, my_id: str) -> None:
     log("   mulligan keep auto       -- keep, auto-bottom the required cards")
     log("   mulligan keep <card_ids> -- keep, bottom these specific cards")
     log("=" * width)
-    show_prompt()
 
 
 if __name__ == "__main__":
