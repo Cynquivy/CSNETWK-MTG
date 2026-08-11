@@ -1175,9 +1175,6 @@ def main() -> None:
     global client_seed
     client_seed = args.seed
 
-    global client_seed
-    client_seed = args.seed
-
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         sock.connect((args.host, args.port))

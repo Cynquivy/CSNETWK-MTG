@@ -509,36 +509,6 @@ class GameServer:
         
     def _using_demo_seed(self) -> bool:
         return self.seed == DEMO_SEED
-    
-    def _set_demo_hand(self, p, cards: list[str]) -> None:
-        full_deck = self._demo_decks[p.player_id]
-    
-        missing = [card_id for card_id in cards if card_id not in full_deck]
-    
-        if missing:
-            raise RuntimeError(
-                f"Demo deck for {p.player_id} is missing required cards: {missing}"
-            )
-    
-        remaining = list(full_deck)
-    
-        for card_id in cards:
-            remaining.remove(card_id)
-    
-        draws = [
-            card_id
-            for card_id in DEMO_DRAW_ORDER.get(p.player_id, [])
-            if card_id in remaining
-        ]
-    
-        for card_id in draws:
-            remaining.remove(card_id)
-    
-        p.hand = list(cards)
-        p.library = remaining + list(reversed(draws))
-
-    def _using_demo_seed(self) -> bool:
-        return self.seed == DEMO_SEED
 
     def _set_demo_hand(self, p, cards: list[str]) -> None:
         full_deck = self._demo_decks[p.player_id]
@@ -1410,6 +1380,15 @@ class GameServer:
             conn.send_pdu(pdu_builders.build_error(
                 seq_num=conn.next_seq(), code="ILLEGAL_ACTION",
                 message=f"'{card_id}' is not a card in the fixed card set.",
+                rejected_action=pdu))
+            return
+
+        # RFC 7.5: lands are played via PLAY_LAND, never cast -- "playing a
+        # land does not use the stack and does not require priority".
+        if spell.card_type == "Land":
+            conn.send_pdu(pdu_builders.build_error(
+                seq_num=conn.next_seq(), code="ILLEGAL_ACTION",
+                message=f"'{card_id}' is a land; play it with PLAY_LAND, not CAST_SPELL.",
                 rejected_action=pdu))
             return
 
