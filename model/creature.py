@@ -33,9 +33,6 @@ class creature(card):
     
     def set_card_type(self):
         self.card_type = "Creature"
-    
-    def place_to_board(self):
-        pass
-    
+
     def effect(self, controller):
         pass

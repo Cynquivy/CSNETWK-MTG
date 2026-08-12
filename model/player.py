@@ -76,36 +76,6 @@ class player:
     
         return True
             
-    def take_mulligan(self):
-        self.mulligan_count += 1
-        
-        self.library.extend(self.hand)
-        self.hand.clear()
-        random.shuffle(self.library)
-        
-        self.draw_from_lib(7)
-        
-        selected_cards = self.select_and_remove_cards(self.mulligan_count)
-        
-        for card in selected_cards:
-            self.library.insert(0, card)
-    
-    def keep_hand(self):
-        selected_cards = self.select_and_remove_cards(self.mulligan_count)
-    
-        for card in selected_cards:
-            self.library.insert(0, card)
-    
-    def select_and_remove_cards(self, count):
-        selected = []
-        
-        for _ in range(count):
-            card = self.game_ui.get_card_selection(self.hand)
-            self.hand.remove(card)
-            selected.append(card)
-
-        return selected
-
     def untapped_mana_sources(self):
         """Permanents on this player's battlefield currently tappable for mana (RFC 7.5)."""
         return [permanent for permanent in self.board
@@ -151,25 +121,3 @@ class player:
         for source in to_tap:
             source.is_tapped = True
         return True
-
-    def select_card_to_stack(self):
-        pass
-    
-    def select_cards_to_board(self):
-        pass
-    
-    def set_board(self):
-        pass
-    
-    def declare_attackers(self):
-        pass
-    
-    def declare_blockers(self):
-        pass
-    
-    def select_land(self):
-        pass
-    
-    def select_creature(self):
-        pass
-        

@@ -621,10 +621,6 @@ def send_discard(conn: Connection, card_ids: list) -> bool:
     conn.send_pdu(pdu_builders.build_discard(seq, card_ids))
     return True
 
-def format_mana_pool(mana_pool: dict) -> str:
-    colors = ["W", "U", "B", "R", "G"]
-    return "   [" + ", ".join(colors) + "]\n   [" + ", ".join(str(mana_pool.get(color, 0)) for color in colors) + "]"
-
 def format_mana_cost(card_id: str) -> str:
     card = card_database.CARD_DATABASE.get(card_id)
 
@@ -844,25 +840,6 @@ _handlers = {
     "ERROR" : _handle_error,
     "PONG" : _handle_pong
 }
-
-# Dummy PDU for echo testing
-def run_self_test(conn: Connection) -> None:
-    dummy = {
-        "type": "PLAYER_READY",
-        "seq_num": 1,
-        "player_id": "player_1",
-        "deck_list": ["test_01", "test_02", "test_03"],
-    }
-    log("[client] self-test: sending dummy PLAYER_READY ...")
-    conn.send_pdu(dummy)
-    echo = conn.recv_pdu()
-    if echo == dummy:
-        log("[client] self-test PASSED: GameServer echoed an identical PDU")
-    else:
-        log("[client] self-test FAILED: echo did not match what was sent")
-        log(f"          sent: {dummy}")
-        log(f"          got:  {echo}")
-
 
 def interactive_loop(conn: Connection) -> None:
     ping_seq = 1
@@ -1185,16 +1162,6 @@ def send_mulligan_choice(conn: Connection, keep: bool, cards_to_bottom: list) ->
 
     return True
 
-
-def receive_and_handle(conn: Connection) -> None:
-    # receives a PDU from the connection, logs it, and dispatches it to the appropriate handler based on its type.
-    response = conn.recv_pdu()
-
-    handler = _handlers.get(response["type"])
-    if handler is None:
-        log(f"[client] Unknown pdu type {response['type']}!")
-    else:
-        handler(conn, response)
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="MTGNP Player Client (Milestone 0)")
